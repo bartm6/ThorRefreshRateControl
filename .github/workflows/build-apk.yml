@@ -1,0 +1,125 @@
+name: Build installable APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK Platform 35
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Configure signing
+        shell: bash
+        env:
+          THOR_KEYSTORE_BASE64: ${{ secrets.THOR_KEYSTORE_BASE64 }}
+          THOR_KEYSTORE_PASSWORD: ${{ secrets.THOR_KEYSTORE_PASSWORD }}
+          THOR_KEY_ALIAS: ${{ secrets.THOR_KEY_ALIAS }}
+          THOR_KEY_PASSWORD: ${{ secrets.THOR_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${THOR_KEYSTORE_BASE64}${THOR_KEYSTORE_PASSWORD}${THOR_KEY_ALIAS}${THOR_KEY_PASSWORD}" ]]; then
+            for value in THOR_KEYSTORE_BASE64 THOR_KEYSTORE_PASSWORD THOR_KEY_ALIAS THOR_KEY_PASSWORD; do
+              if [[ -z "${!value}" ]]; then
+                echo "::error::Missing signing secret: $value"
+                exit 1
+              fi
+            done
+            printf '%s' "$THOR_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/thor-release.jks"
+            echo "THOR_KEYSTORE_FILE=$RUNNER_TEMP/thor-release.jks" >> "$GITHUB_ENV"
+            echo "THOR_KEYSTORE_PASSWORD=$THOR_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "THOR_KEY_ALIAS=$THOR_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "THOR_KEY_PASSWORD=$THOR_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo 'THOR_SIGNING_MODE=production' >> "$GITHUB_ENV"
+            echo 'Release will use the persistent signing certificate.'
+          else
+            echo 'THOR_SIGNING_MODE=testing' >> "$GITHUB_ENV"
+            echo '::warning::No release signing secrets configured. This will be a debug-signed TEST APK; updates may require uninstalling an older build.'
+          fi
+
+      - name: Build minified ARM64 release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain
+
+      - name: Verify and name APK
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/release/app-release.apk'
+          test -s "$apk"
+          test -s app/build/outputs/mapping/release/mapping.txt
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
+          if unzip -Z1 "$apk" | grep -E '^lib/(armeabi|armeabi-v7a|x86|x86_64)/'; then
+            echo '::error::The APK includes native libraries for unsupported architectures.'
+            exit 1
+          fi
+          version="$(sed -nE "s/^[[:space:]]*versionName[[:space:]]+'([^']+)'.*/\1/p" app/build.gradle | head -n1)"
+          test -n "$version"
+          if [[ "${GITHUB_REF_TYPE:-}" == 'tag' && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::The tag ${GITHUB_REF_NAME} does not match app version v${version}."
+            exit 1
+          fi
+          name="ThorRefreshRateControl-v${version}-arm64.apk"
+          cp "$apk" "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "signing=$THOR_SIGNING_MODE" >> "$GITHUB_OUTPUT"
+          echo "APK bytes: $(stat -c %s "$name")"
+          echo "APK: $name (signed: $THOR_SIGNING_MODE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Size: $(du -h "$name" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThorRefreshRateControl-v${{ steps.package.outputs.version }}-APK
+          path: ${{ steps.package.outputs.name }}
+          if-no-files-found: error
+
+      - name: Attach APK to GitHub prerelease
+        # Unsigned/ephemeral runner keys cannot update installed profiles safely.
+        # Test APKs remain available under Actions > Artifacts.
+        if: startsWith(github.ref, 'refs/tags/v') && steps.package.outputs.signing == 'production' 
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.package.outputs.name }}
+          VERSION: ${{ steps.package.outputs.version }}
+          SIGNING: ${{ steps.package.outputs.signing }}
+        run: |
+          set -euo pipefail
+          if [[ "$SIGNING" == 'production' ]]; then
+            notes='ARM64 release APK with R8 optimization, resource shrinking, and persistent release signing.'
+          else
+            notes='TEST APK: R8-optimized and debug-signed using an ephemeral runner key. Installing updates may require uninstalling the previous version and losing local data. Configure the release signing secrets for stable updates.'
+          fi
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "$APK" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "$APK" \
+              --title "ThorRefreshRateControl v${VERSION}" \
+              --notes "$notes" --prerelease --verify-tag
+          fi
