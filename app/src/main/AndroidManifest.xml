@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <!-- Optional advanced game detection permission, also usable by future integrations. -->
+    <uses-permission android:name="android.permission.DUMP" />
+    <!-- RetroArch loopback status; Steam Store lookup only on user request. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only used when the user taps Check for updates to install a GitHub APK. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Only for the user-initiated local ADB pairing workflow. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Resolve labels/icons for launchable apps the accessibility service observes. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- Allow detecting DroidDeck's optional game-state interface. -->
+        <provider android:authorities="com.droiddeck.launcher.agent" />
+    </queries>
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="false"
+        android:allowBackup="false">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <provider
+            android:name=".UpdateApkProvider"
+            android:authorities="com.thor.refreshrate.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+        <service
+            android:name=".AppMonitorService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:label="ThorRefreshRateControl monitoring">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service" />
+        </service>
+    </application>
+</manifest>

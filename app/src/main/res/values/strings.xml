@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ThorRefreshRateControl</string>
+    <string name="accessibility_description">Detects the foreground app and, where available, its window title on the Thor upper screen. RetroArch game detection queries its local status interface only while RetroArch is open. No keystrokes, screen content capture, or remote servers.</string>
+</resources>
