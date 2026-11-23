@@ -22,8 +22,8 @@ android {
         applicationId 'com.thor.refreshrate'
         minSdk 30
         targetSdk 33
-        versionCode 25
-        versionName '1.0.7'
+        versionCode 27
+        versionName '1.0.9'
     }
 
     signingConfigs {

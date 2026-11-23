@@ -384,6 +384,15 @@ final class RateController {
 
         String targetMin = hz == 0 ? prefs.getString(BASE_MIN, null) : minFor(hz);
         String targetPeak = hz == 0 ? prefs.getString(BASE_PEAK, null) : peakFor(hz);
+        if (hz == 0 && !lowerPanelSafe(targetMin)) {
+            // v1.0.8: the manual setting we hand back (e.g. AYN's 120 FPS mode,
+            // 120/120) has no mode the 60 Hz lower panel can show. Restore it as
+            // 60..peak instead: the top panel behaves the same, and the restore
+            // no longer has to wait until the lower screen is turned on again.
+            Log.i(TAG, "Restoring manual " + targetMin + "/" + targetPeak
+                    + " as " + minFor(0) + "/" + targetPeak + " (lower panel is 60 Hz only)");
+            targetMin = minFor(0);
+        }
         if (hz != 0 && same(currentMin, targetMin) && same(currentPeak, targetPeak)) {
             // Already applied: nothing to write, and no reason to wake anything.
             if (owned && previousHz != hz) prefs.edit().putInt(OWNED_HZ, hz).commit();
@@ -397,11 +406,14 @@ final class RateController {
         boolean wakeMode = prefs.getBoolean(ProfileStore.WAKE_LOWER_SCREEN, false);
         if (wakeMode || !lowerPanelSafe(targetMin)) {
             if (!panelsReady()) {
+                Log.i(TAG, "Waiting for both panels before applying " + hz + " Hz"
+                        + (wakeMode ? " (wake option on)" : ""));
                 if (allowWake && wakeMode) wakeBottomDisplayForSwitch();
                 // Otherwise the display-mode observer retries once the lower panel is on.
                 return;
             }
         } else if (!topReady()) {
+            Log.i(TAG, "Top panel asleep or settling; " + hz + " Hz will be applied on wake");
             return;
         }
 

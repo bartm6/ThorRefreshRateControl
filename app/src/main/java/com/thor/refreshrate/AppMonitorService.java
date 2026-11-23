@@ -36,14 +36,10 @@ import java.util.concurrent.TimeUnit;
 /** App changes use Accessibility events; emulator queries run only in active sessions. */
 public final class AppMonitorService extends AccessibilityService {
     /** Quiet period before resolving the top window after window-list churn. */
-    private static final long WINDOW_LOOKUP_DEBOUNCE_MS = 150L;
-    /** Only these window-list changes can mean a different foreground app. */
-    private static final int RELEVANT_WINDOW_CHANGES =
-            AccessibilityEvent.WINDOWS_CHANGE_ADDED
-            | AccessibilityEvent.WINDOWS_CHANGE_REMOVED
-            | AccessibilityEvent.WINDOWS_CHANGE_ACTIVE
-            | AccessibilityEvent.WINDOWS_CHANGE_FOCUSED
-            | AccessibilityEvent.WINDOWS_CHANGE_LAYER;
+    private static final long WINDOW_LOOKUP_DEBOUNCE_MS = 120L;
+    /** Second look once app-switch animations have finished (v1.0.9). Returning
+     * to an app via recents/back/home may send no further event at the end. */
+    private static final long WINDOW_LOOKUP_CONFIRM_MS = 700L;
     private static final long IME_REFRESH_MS = 60_000L;
     /** Draws the dashboard overlay that the physical AYN button toggles. */
     private static final String AYN_PANEL_PACKAGE = "com.odin.dualscreen.assistant";
@@ -74,6 +70,7 @@ public final class AppMonitorService extends AccessibilityService {
     private BroadcastReceiver screenReceiver;
     private final Runnable resumeRates = this::refreshCurrentRate;
     private final Runnable topWindowLookup = this::resolveTopWindow;
+    private final Runnable topWindowConfirm = this::resolveTopWindow;
     private Set<String> imePackages = Collections.emptySet();
     private long imeRefreshedAt = -IME_REFRESH_MS;
 
@@ -168,6 +165,7 @@ public final class AppMonitorService extends AccessibilityService {
     private void syncEnabledState() {
         if (profiles == null || rates == null || profiles.enabled()) return;
         main.removeCallbacks(topWindowLookup);
+        main.removeCallbacks(topWindowConfirm);
         stopRetroWatcher();
         stopDroidWatcher();
         activePkg = null;
@@ -184,11 +182,6 @@ public final class AppMonitorService extends AccessibilityService {
                 && type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
         int displayId = Build.VERSION.SDK_INT >= 33 ? event.getDisplayId() : -1;
         if (displayId > Display.DEFAULT_DISPLAY) return;
-        // Bounds, title, PiP, child and a11y-focus changes can't switch apps.
-        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
-            int changes = event.getWindowChanges();
-            if (changes != 0 && (changes & RELEVANT_WINDOW_CHANGES) == 0) return;
-        }
 
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 && displayId == Display.DEFAULT_DISPLAY && event.getPackageName() != null) {
@@ -205,10 +198,12 @@ public final class AppMonitorService extends AccessibilityService {
                 } else if (pkg.equals(activePkg)) {
                     return;
                 }
-                // The activity event names the app directly; a queued window-list
-                // lookup would only repeat (or race) this answer.
+                // The activity event names the app directly. Still confirm with
+                // the window list once animations settle, in case this event was
+                // for a window that is about to be covered again.
                 main.removeCallbacks(topWindowLookup);
                 handleTarget(new WindowTarget(pkg, activity));
+                scheduleConfirm();
                 return;
             }
         }
@@ -217,6 +212,12 @@ public final class AppMonitorService extends AccessibilityService {
         // lookup is a cross-process query, so coalesce them.
         main.removeCallbacks(topWindowLookup);
         main.postDelayed(topWindowLookup, WINDOW_LOOKUP_DEBOUNCE_MS);
+        scheduleConfirm();
+    }
+
+    private void scheduleConfirm() {
+        main.removeCallbacks(topWindowConfirm);
+        main.postDelayed(topWindowConfirm, WINDOW_LOOKUP_CONFIRM_MS);
     }
 
     private void resolveTopWindow() {
@@ -428,10 +429,14 @@ public final class AppMonitorService extends AccessibilityService {
             for (AccessibilityWindowInfo window : windows) {
                 if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
                 // Only the root's package name is needed. Android 13+ can skip
-                // prefetching the node subtree, keeping each lookup small.
+                // prefetching the node subtree; fall back to a normal fetch.
                 AccessibilityNodeInfo root = Build.VERSION.SDK_INT >= 33
-                        ? window.getRoot(0) : window.getRoot();
-                if (root == null || root.getPackageName() == null) continue;
+                        ? window.getRoot(0) : null;
+                if (root == null) root = window.getRoot();
+                // The topmost app window is unreadable (mid-animation): report
+                // "unknown" rather than wrongly picking the app underneath it.
+                // The confirmation lookup tries again once it has settled.
+                if (root == null || root.getPackageName() == null) return null;
                 String pkg = root.getPackageName().toString();
                 if (skip(pkg)) continue;
                 return new WindowTarget(pkg, null);
@@ -514,6 +519,7 @@ public final class AppMonitorService extends AccessibilityService {
         cleaned = true;
         main.removeCallbacks(resumeRates);
         main.removeCallbacks(topWindowLookup);
+        main.removeCallbacks(topWindowConfirm);
         if (displayModeObserver != null) {
             getContentResolver().unregisterContentObserver(displayModeObserver);
             displayModeObserver = null;

@@ -51,10 +51,10 @@ Plugin 8.7.3, Gradle 8.9, JDK 17, and compile SDK 35.
 
 1. Upload the project root to `main`, including `.github/workflows/build-apk.yml`.
 2. Open **Actions → Build installable APK → Run workflow** (or push to `main`).
-3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.7-APK`
-   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.7-arm64.apk`.
+3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.9-APK`
+   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.9-arm64.apk`.
 4. To publish it under **Releases**, configure persistent signing (below), then
-   create the tag `v1.0.7` from `main`. The workflow attaches that APK to a
+   create the tag `v1.0.9` from `main`. The workflow attaches that APK to a
    GitHub prerelease. **Test-signed artifacts are deliberately not published**
    as update candidates, because their signatures change between runs.
 
@@ -92,6 +92,31 @@ variant, or credentials in the repository are required. **Never publish the
 `.jks` file or any signing password.** Signatures must match to install over
 an existing version; previously installed APKs signed with a different key
 cannot be upgraded in place.
+
+## v1.0.9: reliable foreground-app detection
+
+Fixes a regression from v1.0.5: opening an app was detected immediately, but
+returning to an app (recents, Back, Home) was sometimes missed.
+
+- All window-list changes on the top screen are considered again (v1.0.5
+  ignored some types, including ones sent at the end of switch animations).
+- A second, confirming lookup runs 700 ms after the last window event, once
+  animations have finished, even if Android sends no further event.
+- If the topmost app window can't be read yet, the result is "unknown"
+  instead of falling through to the app underneath it (the one just left).
+- The lightweight root fetch falls back to a normal fetch when it returns
+  nothing.
+
+## v1.0.8: switching never waits for the lower screen
+
+- Switching to an app without a profile hands control back by restoring the
+  previous manual setting. If that was AYN's 120 FPS mode (120/120), v1.0.7
+  waited until the lower screen was on before restoring it, so after a long
+  press of the AYN button turned the lower screen off, those switches stalled.
+  The manual setting is now restored as **60/peak** (60/120 for AYN's 120
+  mode), which looks the same on the top screen and is valid for the 60 Hz
+  lower panel, so it is applied immediately.
+- `adb logcat -s ThorRefresh` now also says when and why a switch is waiting.
 
 ## v1.0.7: no lower-screen wake, and a fix for the black lower screen
 
