@@ -21,6 +21,9 @@ final class ProfileStore {
     private static final String CATEGORIES = "categories.v1";
     private static final String CATEGORY_APP = "category.app.";
     static final String MONITOR_ENABLED = "monitor.enabled";
+    /** Legacy v1.0.3-v1.0.6 behaviour: turn the lower screen on for each switch.
+     * "option." keys are included in settings backups. */
+    static final String WAKE_LOWER_SCREEN = "option.wakeLowerScreen";
     private static final String NAMES_MIGRATED = "steam.names.file.v1";
     private final Context context;
     private final SharedPreferences p;
@@ -47,6 +50,12 @@ final class ProfileStore {
     SharedPreferences preferences() { return p; }
 
     boolean enabled() { return p.getBoolean(MONITOR_ENABLED, true); }
+
+    boolean wakeLowerScreen() { return p.getBoolean(WAKE_LOWER_SCREEN, false); }
+
+    void setWakeLowerScreen(boolean wake) {
+        p.edit().putBoolean(WAKE_LOWER_SCREEN, wake).commit();
+    }
 
     void setEnabled(boolean enabled) {
         if (enabled() != enabled) p.edit().putBoolean(MONITOR_ENABLED, enabled).commit();

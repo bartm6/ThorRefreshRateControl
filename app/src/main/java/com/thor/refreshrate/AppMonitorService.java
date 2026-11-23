@@ -45,6 +45,8 @@ public final class AppMonitorService extends AccessibilityService {
             | AccessibilityEvent.WINDOWS_CHANGE_FOCUSED
             | AccessibilityEvent.WINDOWS_CHANGE_LAYER;
     private static final long IME_REFRESH_MS = 60_000L;
+    /** Draws the dashboard overlay that the physical AYN button toggles. */
+    private static final String AYN_PANEL_PACKAGE = "com.odin.dualscreen.assistant";
     // Adaptive emulator polling: fast right after a change, slow once stable.
     private static final long RETRO_FAST_MS = 700L;
     private static final long DROID_FAST_MS = 800L;
@@ -80,7 +82,7 @@ public final class AppMonitorService extends AccessibilityService {
         super.onServiceConnected();
         cleaned = false;
         profiles = new ProfileStore(this);
-        rates = new RateController(this, this::scheduleRateRefresh);
+        rates = new RateController(this, this::scheduleRateRefresh, this::isAynPanelShowing);
         // The bottom display can disappear during TOP-only mode or sleep.
         // Resume a profile only after the dual-screen mode has settled.
         displayModeObserver = new ContentObserver(main) {
@@ -438,6 +440,31 @@ public final class AppMonitorService extends AccessibilityService {
             // Some firmware versions restrict access to other apps' window titles.
         }
         return null;
+    }
+
+    /**
+     * Whether AYN's dashboard overlay is visible on a secondary display.
+     * Called on RateController's worker thread; accessibility window queries
+     * are binder calls and are safe off the main thread.
+     */
+    private boolean isAynPanelShowing() {
+        if (cleaned) return false;
+        SparseArray<List<AccessibilityWindowInfo>> screens = getWindowsOnAllDisplays();
+        if (screens == null) return false;
+        for (int i = 0; i < screens.size(); i++) {
+            if (screens.keyAt(i) == Display.DEFAULT_DISPLAY) continue;
+            List<AccessibilityWindowInfo> windows = screens.valueAt(i);
+            if (windows == null) continue;
+            for (AccessibilityWindowInfo window : windows) {
+                CharSequence title = window.getTitle();
+                if (title != null && title.toString().contains(AYN_PANEL_PACKAGE)) return true;
+                AccessibilityNodeInfo root = Build.VERSION.SDK_INT >= 33
+                        ? window.getRoot(0) : window.getRoot();
+                if (root != null && root.getPackageName() != null
+                        && AYN_PANEL_PACKAGE.contentEquals(root.getPackageName())) return true;
+            }
+        }
+        return false;
     }
 
     private boolean skip(String pkg) {

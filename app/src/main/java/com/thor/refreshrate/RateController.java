@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 /**
  * Applies AYN Smooth Display policies while both built-in panels are awake.
@@ -55,6 +56,14 @@ final class RateController {
     private static final String BASE_MIN = "controller.baselineMin";
     private static final String BASE_PEAK = "controller.baselinePeak";
     private static final String TEMP_WAKE_AT = "controller.temporaryBottomWakeAt";
+    /** Linux KEY_F24: the Thor's physical AYN button (gpio-keys). AYN's
+     * dual-screen assistant opens its dashboard overlay when it sees this key. */
+    private static final int KEY_F24 = 194;
+    private static final String AYN_KEY_DEVICE_NAME = "gpio-keys";
+    /** Verified on stock Thor firmware; used only if discovery fails. */
+    private static final String AYN_KEY_DEVICE_FALLBACK = "/dev/input/event0";
+    /** Give the vendor assistant a moment to attach to the freshly lit panel. */
+    private static final long PANEL_PRESS_DELAY_MS = 400L;
 
     private static Handler sharedWorker;
 
@@ -81,6 +90,8 @@ final class RateController {
     private final Runnable restoreBottomMode = this::restorePreviousDisplayMode;
     private final Runnable wakeTimeout = this::restorePreviousDisplayMode;
     private final Runnable applyLatest = this::applyLatestTarget;
+    private final Runnable pressAynButton = this::pressAynButtonIfPanelHidden;
+    private final BooleanSupplier aynPanelShowing;
 
     // Written from any thread.
     private volatile long safeAfterUptime;
@@ -90,9 +101,19 @@ final class RateController {
     private long lastWakeRequestUptime = -WAKE_REQUEST_COOLDOWN_MS;
     private boolean temporarilyEnabledBottom;
     private int restoreAttempts;
+    /** Show AYN's dashboard once the panel we woke is actually on. */
+    private boolean panelPending;
+    private DisplayManager.DisplayListener displayListener;
+    private String aynKeyDevice;
 
-    /** @param onBottomDisplayWakeRequested always invoked on the main thread. */
-    RateController(Context context, Runnable onBottomDisplayWakeRequested) {
+    /**
+     * @param onBottomDisplayWakeRequested always invoked on the main thread.
+     * @param aynPanelShowing whether AYN's dashboard overlay is already visible
+     *        on the lower panel; called on the worker thread. May be null.
+     */
+    RateController(Context context, Runnable onBottomDisplayWakeRequested,
+                   BooleanSupplier aynPanelShowing) {
+        this.aynPanelShowing = aynPanelShowing;
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
         this.prefs = new ProfileStore(context).preferences();
@@ -100,6 +121,7 @@ final class RateController {
         // Delay the first write until Android has restored both panels.
         postponeDisplayChanges();
         worker.post(this::recoverInterruptedWake);
+        worker.post(this::registerDisplayListener);
     }
 
     boolean canWrite() {
@@ -170,7 +192,103 @@ final class RateController {
         }
     }
 
+    /** Reacts the moment the lower panel turns on, instead of waiting for the
+     * 2-second settle guard, so the dashboard appears with the panel. */
+    private void registerDisplayListener() {
+        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        if (dm == null || displayListener != null) return;
+        displayListener = new DisplayManager.DisplayListener() {
+            @Override public void onDisplayAdded(int displayId) { showPanelIfPending(); }
+            @Override public void onDisplayChanged(int displayId) { showPanelIfPending(); }
+            @Override public void onDisplayRemoved(int displayId) { }
+        };
+        dm.registerDisplayListener(displayListener, worker);
+    }
+
+    private void unregisterDisplayListener() {
+        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        if (dm != null && displayListener != null) dm.unregisterDisplayListener(displayListener);
+        displayListener = null;
+    }
+
+    /**
+     * Only after this controller turned the lower panel on for a switch: open
+     * AYN's dashboard there, so its "60/120 FPS MODE" badge confirms the
+     * change. A panel the user had on already is never touched.
+     */
+    private void showPanelIfPending() {
+        if (!panelPending || !temporarilyEnabledBottom || !bottomPanelOn()) return;
+        panelPending = false;
+        worker.removeCallbacks(pressAynButton);
+        worker.postDelayed(pressAynButton, PANEL_PRESS_DELAY_MS);
+    }
+
+    private boolean bottomPanelOn() {
+        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        Display bottom = BottomDisplay.find(dm);
+        return bottom != null && bottom.getState() == Display.STATE_ON;
+    }
+
+    /**
+     * The AYN button toggles the dashboard, so it is pressed only when the
+     * overlay is not already visible. The press is injected at the kernel
+     * input level (identical to the physical button) because Android has no
+     * key code for F24 that the vendor assistant would recognise.
+     */
+    private void pressAynButtonIfPanelHidden() {
+        if (!temporarilyEnabledBottom || displayMode() != 0 || !bottomPanelOn()) return;
+        if (aynPanelShowing != null) {
+            try {
+                if (aynPanelShowing.getAsBoolean()) return;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not check the AYN panel; not pressing the button", e);
+                return;
+            }
+        }
+        String device = aynKeyDevice();
+        String key = "sendevent " + device + " 1 " + KEY_F24 + " ";
+        String sync = "sendevent " + device + " 0 0 0";
+        boolean ok = ThorBridge.run(key + "1") && ThorBridge.run(sync);
+        // Always release the key, even if the press failed half-way.
+        ok &= ThorBridge.run(key + "0") & ThorBridge.run(sync);
+        if (!ok) Log.w(TAG, "Could not press the AYN button on " + device);
+    }
+
+    /** Finds the gpio-keys input node by name; event numbers can change per boot. */
+    private String aynKeyDevice() {
+        if (aynKeyDevice != null) return aynKeyDevice;
+        String found = parseInputDevice(ThorBridge.output("cat /proc/bus/input/devices"),
+                AYN_KEY_DEVICE_NAME);
+        if (found != null) {
+            aynKeyDevice = found;
+            Log.i(TAG, "AYN button input device: " + found);
+            return found;
+        }
+        Log.w(TAG, "AYN button device not found; using " + AYN_KEY_DEVICE_FALLBACK);
+        return AYN_KEY_DEVICE_FALLBACK;
+    }
+
+    /** Parses /proc/bus/input/devices; returns e.g. /dev/input/event0, or null. */
+    static String parseInputDevice(String devices, String name) {
+        if (devices == null) return null;
+        boolean inDevice = false;
+        for (String raw : devices.split("\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) {
+                inDevice = false;
+            } else if (line.startsWith("N: Name=")) {
+                inDevice = line.equals("N: Name=\"" + name + "\"");
+            } else if (inDevice && line.startsWith("H: Handlers=")) {
+                for (String handler : line.substring("H: Handlers=".length()).split("\\s+")) {
+                    if (handler.matches("event[0-9]{1,3}")) return "/dev/input/" + handler;
+                }
+            }
+        }
+        return null;
+    }
+
     private void stopOnWorker() {
+        unregisterDisplayListener();
         // Never initiate a new asynchronous wake on teardown: there will be
         // no monitor left to retry the pending refresh-rate operation.
         if (panelsReady()) applyTarget(0, false);
@@ -208,6 +326,35 @@ final class RateController {
         return Settings.System.getString(resolver, key);
     }
 
+    /** Lowest rate the Thor's fixed 60 Hz lower panel supports. */
+    private static final float LOWER_PANEL_HZ = 60f;
+
+    /**
+     * v1.0.7: every profile keeps 60 Hz inside the allowed range. The lower
+     * panel only has a 60 Hz mode, and these keys apply to both panels, so
+     * min = peak = 120 left it with no valid mode. That is the likely cause of
+     * the lower screen going black and unresponsive. 60..120 still lets the
+     * top panel run at 120; 60..60 locks it to 60.
+     */
+    static String minFor(int hz) { return "60.0"; }
+
+    static String peakFor(int hz) { return hz == 120 ? "120.00001" : "60.0"; }
+
+    /** A range the lower panel can display, so it may be written while that panel is off. */
+    private static boolean lowerPanelSafe(String min) {
+        return parse(min, 0f) <= LOWER_PANEL_HZ + 0.5f;
+    }
+
+    /** Direct switching only needs the top panel awake and settled. */
+    private boolean topReady() {
+        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        if (power == null || !power.isInteractive()) return false;
+        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        Display top = dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
+        return top != null && top.getState() == Display.STATE_ON
+                && SystemClock.uptimeMillis() >= safeAfterUptime;
+    }
+
     /** Executed only on foreground changes or when a profile is edited. */
     private void applyTarget(int hz, boolean allowWake) {
         if (!canWrite() || (hz != 0 && hz != 60 && hz != 120)) return;
@@ -230,37 +377,37 @@ final class RateController {
             prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ).commit();
             owned = false;
         }
-
-        String value = hz == 120 ? "120.00001" : "60.0";
-        if (hz == 0) {
-            if (!owned) {
-                restoreAfterSwitch();
-                return;
-            }
-        } else {
-            // Do not wake the lower display when nothing needs changing.
-            if (owned && previousHz == hz) {
-                restoreAfterSwitch();
-                return;
-            }
-            if (!owned && same(currentMin, value) && same(currentPeak, value)) {
-                restoreAfterSwitch();
-                return;
-            }
+        if (hz == 0 && !owned) {
+            restoreAfterSwitch();
+            return;
         }
 
-        // The global rate keys may blank the Thor's lower panel if written in
-        // top-only mode. Ask the stock assistant to enable dual-screen mode,
-        // then return: AppMonitorService will retry after the panel settles.
-        if (!panelsReady()) {
-            if (allowWake) wakeBottomDisplayForSwitch();
+        String targetMin = hz == 0 ? prefs.getString(BASE_MIN, null) : minFor(hz);
+        String targetPeak = hz == 0 ? prefs.getString(BASE_PEAK, null) : peakFor(hz);
+        if (hz != 0 && same(currentMin, targetMin) && same(currentPeak, targetPeak)) {
+            // Already applied: nothing to write, and no reason to wake anything.
+            if (owned && previousHz != hz) prefs.edit().putInt(OWNED_HZ, hz).commit();
+            restoreAfterSwitch();
+            return;
+        }
+
+        // Writes whose range the lower panel can show go straight through, even
+        // with that panel off. Anything else (only a restored manual baseline
+        // above 60 Hz, or the optional legacy mode) waits for both panels.
+        boolean wakeMode = prefs.getBoolean(ProfileStore.WAKE_LOWER_SCREEN, false);
+        if (wakeMode || !lowerPanelSafe(targetMin)) {
+            if (!panelsReady()) {
+                if (allowWake && wakeMode) wakeBottomDisplayForSwitch();
+                // Otherwise the display-mode observer retries once the lower panel is on.
+                return;
+            }
+        } else if (!topReady()) {
             return;
         }
 
         boolean ok;
         if (hz == 0) {
-            ok = writePair(prefs.getString(BASE_MIN, null),
-                    prefs.getString(BASE_PEAK, null), currentMin, currentPeak);
+            ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
             if (ok) {
                 prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ)
                         .remove(BASE_MIN).remove(BASE_PEAK).commit();
@@ -273,16 +420,17 @@ final class RateController {
                 prefs.edit().putString(BASE_MIN, currentMin)
                         .putString(BASE_PEAK, currentPeak).commit();
             }
-            ok = writePair(value, value, currentMin, currentPeak);
+            ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
             if (ok) {
                 prefs.edit().putBoolean(OWNED, true).putInt(OWNED_HZ, hz).commit();
             } else {
                 prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ).commit();
             }
         }
-        Log.i(TAG, String.format(Locale.ROOT, "%s %s in %d ms",
+        Log.i(TAG, String.format(Locale.ROOT, "%s %s in %d ms (%s)",
                 hz == 0 ? "Released override" : "Applied " + hz + " Hz",
-                ok ? "ok" : "FAILED", SystemClock.uptimeMillis() - startedAt));
+                ok ? "ok" : "FAILED", SystemClock.uptimeMillis() - startedAt,
+                temporarilyEnabledBottom ? "lower screen woken" : "direct"));
         // Restore top-only mode only when this controller turned the lower
         // panel on for the switch. An already-on panel must stay on.
         restoreAfterSwitch();
@@ -328,6 +476,8 @@ final class RateController {
 
     private void clearTemporaryWake() {
         temporarilyEnabledBottom = false;
+        panelPending = false;
+        worker.removeCallbacks(pressAynButton);
         restoreAttempts = 0;
         worker.removeCallbacks(restoreBottomMode);
         worker.removeCallbacks(wakeTimeout);
@@ -355,6 +505,7 @@ final class RateController {
             return;
         }
         temporarilyEnabledBottom = true;
+        panelPending = true;
         restoreAttempts = 0;
         prefs.edit().putLong(TEMP_WAKE_AT, System.currentTimeMillis()).commit();
         worker.removeCallbacks(wakeTimeout);
@@ -404,12 +555,14 @@ final class RateController {
     /** An external/manual rate change relinquishes the previous app override. */
     private static boolean matchesOwned(String min, String peak, int hz) {
         if (hz == 0 || min == null || peak == null) return false;
-        try {
-            return Math.abs(Float.parseFloat(min) - hz) < 0.1f
-                    && Math.abs(Float.parseFloat(peak) - hz) < 0.1f;
-        } catch (NumberFormatException invalid) {
-            return false;
-        }
+        // Current ranges, or the min = peak = Hz ranges written up to v1.0.6
+        // (so an update keeps ownership and corrects the old 120/120 lock).
+        return (same(min, minFor(hz)) && same(peak, peakFor(hz)))
+                || (near(min, hz) && near(peak, hz));
+    }
+
+    private static boolean near(String value, int hz) {
+        return value != null && Math.abs(parse(value, -1f) - hz) < 0.1f;
     }
 
     private static float parse(String value, float fallback) {
@@ -459,7 +612,12 @@ final class RateController {
     private static final class ThorBridge {
         private static IBinder service;
 
-        static synchronized boolean run(String command) {
+        static boolean run(String command) {
+            return output(command) != null;
+        }
+
+        /** Runs a fixed command; returns its output ("" if none) or null on failure. */
+        static synchronized String output(String command) {
             long startedAt = SystemClock.uptimeMillis();
             boolean ok = false;
             try {
@@ -468,29 +626,26 @@ final class RateController {
                     Method method = cls.getDeclaredMethod("getService", String.class);
                     service = (IBinder) method.invoke(null, "PServerBinder");
                 }
-                if (service == null) return false;
+                if (service == null) return null;
                 Parcel data = Parcel.obtain();
                 Parcel reply = Parcel.obtain();
                 try {
                     data.writeStringArray(new String[] {command, "1"});
-                    if (!service.transact(0, data, reply, 0)) return false;
+                    if (!service.transact(0, data, reply, 0)) return null;
                     // The vendor method returns a byte array. Reading it also
                     // propagates malformed replies into the safe fallback.
-                    byte[] output = reply.createByteArray();
-                    if (output != null) {
-                        String result = new String(output, StandardCharsets.UTF_8).trim();
-                        if (result.toLowerCase(Locale.ROOT).contains("permission denied"))
-                            return false;
-                    }
+                    byte[] bytes = reply.createByteArray();
+                    String result = bytes == null ? "" : new String(bytes, StandardCharsets.UTF_8);
+                    if (result.toLowerCase(Locale.ROOT).contains("permission denied")) return null;
                     ok = true;
-                    return true;
+                    return result;
                 } finally {
                     reply.recycle();
                     data.recycle();
                 }
             } catch (Exception | LinkageError e) {
                 Log.w(TAG, "AYN privileged refresh-rate service unavailable", e);
-                return false;
+                return null;
             } finally {
                 // Lets you measure real bridge latency: adb logcat -s ThorRefresh
                 Log.d(TAG, String.format(Locale.ROOT, "bridge %s (%d ms): %s",

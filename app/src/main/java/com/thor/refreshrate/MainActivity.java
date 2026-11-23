@@ -149,6 +149,9 @@ public final class MainActivity extends Activity {
             profiles.setEnabled(enabled);
             draw(true);
         });
+        TextView version = text("Current version: " + installedVersionName(), 12, MUTED, false);
+        version.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        version.setContentDescription("Installed version " + installedVersionName());
         TextView update = text("↻", 25, ACCENT, false);
         update.setGravity(Gravity.CENTER);
         update.setMinWidth(dp(44));
@@ -159,7 +162,13 @@ public final class MainActivity extends Activity {
             PopupMenu menu = new PopupMenu(this, update);
             menu.getMenu().add("Backup settings");
             menu.getMenu().add("Restore settings");
+            String wakeItem = "Wake lower screen for switches";
+            menu.getMenu().add(wakeItem).setCheckable(true).setChecked(profiles.wakeLowerScreen());
             menu.setOnMenuItemClickListener(item -> {
+                if (wakeItem.contentEquals(item.getTitle())) {
+                    profiles.setWakeLowerScreen(!profiles.wakeLowerScreen());
+                    return true;
+                }
                 if ("Backup settings".contentEquals(item.getTitle())) {
                     Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
                     intent.setType("application/json");
@@ -177,6 +186,7 @@ public final class MainActivity extends Activity {
             menu.show();
             return true;
         });
+        header.addView(version);
         header.addView(update);
         header.addView(power);
         content.addView(header);
@@ -775,6 +785,16 @@ public final class MainActivity extends Activity {
             icon.setImageDrawable(getPackageManager().getApplicationIcon(packageName));
         } catch (PackageManager.NameNotFoundException ignored) { }
         return icon;
+    }
+
+    private String installedVersionName() {
+        try {
+            @SuppressWarnings("deprecation")
+            String name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            return name == null ? "?" : name;
+        } catch (PackageManager.NameNotFoundException e) {
+            return "?";
+        }
     }
 
     private int dp(int value) { return Math.round(getResources().getDisplayMetrics().density * value); }

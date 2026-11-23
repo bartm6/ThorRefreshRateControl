@@ -51,10 +51,10 @@ Plugin 8.7.3, Gradle 8.9, JDK 17, and compile SDK 35.
 
 1. Upload the project root to `main`, including `.github/workflows/build-apk.yml`.
 2. Open **Actions → Build installable APK → Run workflow** (or push to `main`).
-3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.5-APK`
-   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.5-arm64.apk`.
+3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.7-APK`
+   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.7-arm64.apk`.
 4. To publish it under **Releases**, configure persistent signing (below), then
-   create the tag `v1.0.5` from `main`. The workflow attaches that APK to a
+   create the tag `v1.0.7` from `main`. The workflow attaches that APK to a
    GitHub prerelease. **Test-signed artifacts are deliberately not published**
    as update candidates, because their signatures change between runs.
 
@@ -92,6 +92,44 @@ variant, or credentials in the repository are required. **Never publish the
 `.jks` file or any signing password.** Signatures must match to install over
 an existing version; previously installed APKs signed with a different key
 cannot be upgraded in place.
+
+## v1.0.7: no lower-screen wake, and a fix for the black lower screen
+
+- **Root cause of the black, unresponsive lower screen (likely):** the Thor's
+  lower panel only supports 60 Hz, but `min_refresh_rate` and
+  `peak_refresh_rate` apply to both panels. The 120 Hz profile used to write
+  min = peak = 120, which leaves the lower panel with no valid mode.
+  The 120 Hz profile now writes **min 60 / peak 120**. The top panel still runs
+  at 120 Hz (Android uses the top of the allowed range unless an app asks for
+  less); 60 Hz profiles still lock to 60/60.
+- **No more lower-screen flicker.** Because every profile range is now valid
+  for the lower panel, switches are written directly, even in top-only mode.
+  The old behaviour (wake the lower screen and show the AYN panel) is
+  available as **Wake lower screen for switches** in the update button's
+  long-press menu, off by default.
+- A restored manual baseline above 60 Hz is still only written while both
+  panels are on.
+- Existing installs keep ownership of the old 120/120 values, and correct
+  them on the next switch.
+- **Current version** is shown next to the update button.
+
+## v1.0.6: open the AYN panel during a temporary lower-screen wake
+
+When the app has to turn the lower screen on for a refresh-rate switch
+(top-only mode), it now opens AYN's dashboard there (the overlay drawn by
+`com.odin.dualscreen.assistant`, showing "60/120 FPS MODE", temperature, fan
+and CPU/GPU). The badge doubles as visual confirmation of the switch.
+
+- It works by pressing the physical **AYN button** virtually: a `KEY_F24`
+  down/up on the `gpio-keys` input device, sent through the AYN bridge. That
+  is identical to a real button press. The device node is found by name in
+  `/proc/bus/input/devices` (fallback: `/dev/input/event0`).
+- The button toggles the dashboard, so it is pressed only if the overlay is
+  not already visible on the lower screen (checked through accessibility).
+- Only when the app itself woke the lower screen. If the lower screen was
+  already on, it is never touched.
+- Triggered 400 ms after the lower panel reports that it is on, not after the
+  2-second settle guard.
 
 ## v1.0.5: smoother switching and more robust detection
 
