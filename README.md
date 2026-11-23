@@ -51,10 +51,10 @@ Plugin 8.7.3, Gradle 8.9, JDK 17, and compile SDK 35.
 
 1. Upload the project root to `main`, including `.github/workflows/build-apk.yml`.
 2. Open **Actions → Build installable APK → Run workflow** (or push to `main`).
-3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.11-APK`
-   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.11-arm64.apk`.
+3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.12-APK`
+   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.12-arm64.apk`.
 4. To publish it under **Releases**, configure persistent signing (below), then
-   create the tag `v1.0.11` from `main`. The workflow attaches that APK to a
+   create the tag `v1.0.12` from `main`. The workflow attaches that APK to a
    GitHub prerelease. **Test-signed artifacts are deliberately not published**
    as update candidates, because their signatures change between runs.
 
@@ -93,129 +93,24 @@ variant, or credentials in the repository are required. **Never publish the
 an existing version; previously installed APKs signed with a different key
 cannot be upgraded in place.
 
-## v1.0.11: switches kick in after 0.5 s
+## v1.0.12: back to basics
 
-- Default switch delay is now **0.5 s** (choices: 0.25 s / 0.5 s / 1 s in the
-  update button's long-press menu; older saved values are capped at 1 s).
-- Minimum gap between writes reduced from 3 s to 0.5 s. Because a request must
-  already be stable for the switch delay, the gap never adds extra waiting.
-- Only exception: right after the lower screen turns on/off, writes wait for
-  the 2-second panel guard (black-screen protection).
+v1.0.5-v1.0.11 added untested mechanisms (virtual AYN-button presses, the
+AYN panel, a 60-120 range, timers, extra detection logic) that made switching
+unreliable and could black out the lower screen. v1.0.12 returns to the v1.0.4
+app (detection, profiles, UI) with a much smaller refresh-rate controller:
 
-## v1.0.10: calmer switching (fixes black lower screen when swapping quickly)
-
-v1.0.9 detected every app switch, so swapping quickly caused bursts of
-refresh-rate writes. That desynchronised AYN's FPS badge from the real rate
-and could blank the lower screen. Switching is now deliberately calm:
-
-- **Switch delay** (default 1.5 s): a rate is applied only after the
-  foreground app has stayed the same for this long. Swapping through several
-  apps causes one write, for the app you land on. Change it in the update
-  button's long-press menu (0.5 s / 1.5 s / 3 s).
-- **Minimum gap**: at most one refresh-rate write every 3 seconds; newer
-  requests are applied when the gap has passed.
-- **Lower-panel guard**: whenever the lower panel changes power state (on,
-  off, dozing), writes wait 2 seconds and then retry automatically.
-
-## v1.0.9: reliable foreground-app detection
-
-Fixes a regression from v1.0.5: opening an app was detected immediately, but
-returning to an app (recents, Back, Home) was sometimes missed.
-
-- All window-list changes on the top screen are considered again (v1.0.5
-  ignored some types, including ones sent at the end of switch animations).
-- A second, confirming lookup runs 700 ms after the last window event, once
-  animations have finished, even if Android sends no further event.
-- If the topmost app window can't be read yet, the result is "unknown"
-  instead of falling through to the app underneath it (the one just left).
-- The lightweight root fetch falls back to a normal fetch when it returns
-  nothing.
-
-## v1.0.8: switching never waits for the lower screen
-
-- Switching to an app without a profile hands control back by restoring the
-  previous manual setting. If that was AYN's 120 FPS mode (120/120), v1.0.7
-  waited until the lower screen was on before restoring it, so after a long
-  press of the AYN button turned the lower screen off, those switches stalled.
-  The manual setting is now restored as **60/peak** (60/120 for AYN's 120
-  mode), which looks the same on the top screen and is valid for the 60 Hz
-  lower panel, so it is applied immediately.
-- `adb logcat -s ThorRefresh` now also says when and why a switch is waiting.
-
-## v1.0.7: no lower-screen wake, and a fix for the black lower screen
-
-- **Root cause of the black, unresponsive lower screen (likely):** the Thor's
-  lower panel only supports 60 Hz, but `min_refresh_rate` and
-  `peak_refresh_rate` apply to both panels. The 120 Hz profile used to write
-  min = peak = 120, which leaves the lower panel with no valid mode.
-  The 120 Hz profile now writes **min 60 / peak 120**. The top panel still runs
-  at 120 Hz (Android uses the top of the allowed range unless an app asks for
-  less); 60 Hz profiles still lock to 60/60.
-- **No more lower-screen flicker.** Because every profile range is now valid
-  for the lower panel, switches are written directly, even in top-only mode.
-  The old behaviour (wake the lower screen and show the AYN panel) is
-  available as **Wake lower screen for switches** in the update button's
-  long-press menu, off by default.
-- A restored manual baseline above 60 Hz is still only written while both
-  panels are on.
-- Existing installs keep ownership of the old 120/120 values, and correct
-  them on the next switch.
-- **Current version** is shown next to the update button.
-
-## v1.0.6: open the AYN panel during a temporary lower-screen wake
-
-When the app has to turn the lower screen on for a refresh-rate switch
-(top-only mode), it now opens AYN's dashboard there (the overlay drawn by
-`com.odin.dualscreen.assistant`, showing "60/120 FPS MODE", temperature, fan
-and CPU/GPU). The badge doubles as visual confirmation of the switch.
-
-- It works by pressing the physical **AYN button** virtually: a `KEY_F24`
-  down/up on the `gpio-keys` input device, sent through the AYN bridge. That
-  is identical to a real button press. The device node is found by name in
-  `/proc/bus/input/devices` (fallback: `/dev/input/event0`).
-- The button toggles the dashboard, so it is pressed only if the overlay is
-  not already visible on the lower screen (checked through accessibility).
-- Only when the app itself woke the lower screen. If the lower screen was
-  already on, it is never touched.
-- Triggered 400 ms after the lower panel reports that it is on, not after the
-  2-second settle guard.
-
-## v1.0.5: smoother switching and more robust detection
-
-No settings, profiles, permissions or storage keys change; this is an in-place
-update. Display-mode behaviour (temporary lower-screen wake and restore) is the
-same as v1.0.4.
-
-- **Switching no longer blocks the monitor.** Every AYN bridge call is a
-  synchronous binder call that runs a shell command, and a switch can need
-  several. They now run on a dedicated `Thor-Rate` worker thread instead of the
-  accessibility service's main thread. If several requests arrive while one is
-  in progress, only the newest target is applied.
-- **Lower panel found dynamically.** The bottom display is no longer assumed to
-  be display 4. The app picks the built-in, non-default display reported by
-  Android (ID 4 is only a tie-breaker), so a firmware renumbering doesn't
-  silently stop switching.
-- **Every keyboard is ignored**, not only Gboard. Opening any installed input
-  method on the top screen is no longer treated as an app switch.
-- **Fewer window lookups.** Window-list changes that can't mean an app switch
-  (bounds, titles, PiP, child windows) are ignored. The remaining ones are
-  coalesced with a 150 ms quiet period. The lookup itself fetches only the root
-  node (no subtree prefetch) on Android 13.
-- **Adaptive game polling.** RetroArch (700 ms) and DroidDeck (800 ms) are
-  polled quickly after any change, then every 2 s once the reading has been
-  stable for five polls. Any change returns to fast polling.
-- **Fix:** RetroArch and DroidDeck watchers previously shared one cancellation
-  counter. Stopping one could leave a running RetroArch watcher discarding all
-  results until you left and re-entered RetroArch (seen when the service
-  reconnected while RetroArch was open). Each watcher now has its own token.
-
-**Diagnostics:** `adb logcat -s ThorRefresh` now shows which display was chosen
-as the lower panel, the duration of every bridge command, and the total time
-of each switch.
-
-**Hardware validation required:** the threading change affects every switch.
-Test 60→120 and 120→60 with the lower panel on and in top-only mode, a reboot
-with a profiled app in the foreground, and turning the monitor off and on.
+- Values are locked exactly as in v1.0.4: 60/60 or 120.00001/120.00001.
+- They are only written while both screens are on and have been stable for
+  2 seconds. In top-only mode the lower screen is switched on for the write
+  and off again 1.5 seconds later.
+- A switch is applied 0.5 s after the foreground app settles.
+- No key presses, no overlays, no extra settings.
+- Failures never loop: a target that failed is not retried until a different
+  one is requested.
+- If the lower screen was turned off another way (e.g. long-pressing the AYN
+  button), the app waits until it is on again instead of forcing anything.
+- "Current version" is shown next to the update button.
 
 ## v1.0.4: restore the original lower-screen state after switching
 

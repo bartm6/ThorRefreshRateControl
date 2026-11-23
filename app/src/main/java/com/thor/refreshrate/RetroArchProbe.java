@@ -38,11 +38,6 @@ final class RetroArchProbe {
             this.title = title;
         }
 
-        /** Stable identity of this reading, used to slow polling while unchanged. */
-        String key() {
-            return loaded ? "loaded:" + idPart : "contentless";
-        }
-
         static Status parse(String message) {
             if (message == null) return null;
             String status = message.trim();

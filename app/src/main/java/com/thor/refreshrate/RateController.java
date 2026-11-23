@@ -7,10 +7,8 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
-import android.os.Looper;
 import android.os.Parcel;
 import android.os.PowerManager;
-import android.os.Process;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
@@ -21,708 +19,352 @@ import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BooleanSupplier;
 
 /**
- * Applies AYN Smooth Display policies while both built-in panels are awake.
+ * Sets the Thor's refresh rate. Deliberately small (v1.0.12).
  *
- * <p>Threading (v1.0.5): every AYN bridge call is a synchronous binder round
- * trip that runs a shell command, and a switch can need several of them. Up to
- * v1.0.4 they ran on the accessibility service's main thread, stalling event
- * delivery during every switch. Now all bridge calls and all mutable state
- * below are confined to one process-wide worker thread. Public methods only
- * post to it (or touch volatile fields), so callers never block.
+ * One rule: min/peak_refresh_rate are only written while BOTH screens are on
+ * and settled, because these settings apply to both panels and writing them
+ * while the 60 Hz lower panel is off can leave it black. In top-only mode the
+ * lower screen is switched on for the write and switched off again afterwards
+ * (the proven v1.0.4 behaviour). Nothing else: no key presses, no overlays.
  *
- * <p>Requests are coalesced: if several targets arrive while the worker is
- * busy, only the newest is applied. That is the desired state anyway, and it
- * avoids, e.g., briefly applying 120 Hz for an app that was already closed.
+ * Everything runs on one background thread; public methods only post to it.
  */
 final class RateController {
     private static final String TAG = "ThorRefresh";
     private static final String MIN = "min_refresh_rate";
     private static final String PEAK = "peak_refresh_rate";
     static final String DUAL_SCREEN_MODE = "dual_screen_display_mode";
-    private static final long WAKE_SETTLE_MS = 2000L;
-    private static final long WAKE_REQUEST_COOLDOWN_MS = 6000L;
-    private static final long RESTORE_SETTLE_MS = 1500L;
-    private static final long RESTORE_RETRY_MS = 1200L;
-    private static final long WAKE_TIMEOUT_MS = 12000L;
-    private static final long RECOVERY_WINDOW_MS = 30000L;
-    /** Upper bound for blocking service teardown while we relinquish the rate. */
-    private static final long STOP_WAIT_MS = 2000L;
-    private static final int MAX_RESTORE_ATTEMPTS = 3;
-    /** At most one refresh-rate write per this interval. Because a request must
-     * already be stable for the switch delay (0.5 s by default), this never
-     * delays a switch beyond that; it only caps bursts. (3 s in v1.0.10.) */
-    private static final long MIN_WRITE_GAP_MS = 500L;
+    private static final int MODE_BOTH = 0;
+    private static final int MODE_TOP_ONLY = 1;
+
+    /** A new target is applied once it has been stable this long. */
+    private static final long SWITCH_DELAY_MS = 500L;
+    /** No writes for this long after any screen/mode change. */
+    private static final long SETTLE_MS = 2000L;
+    /** While waiting for a woken lower screen, check again this often. */
+    private static final long RETRY_MS = 1000L;
+    /** Give up waiting for the lower screen after this long. */
+    private static final long WAKE_TIMEOUT_MS = 8000L;
+    /** Keep a woken lower screen on this long after the write. */
+    private static final long RESTORE_DELAY_MS = 1500L;
+
+    // Same keys as v1.0.4 so an update keeps its state.
     private static final String OWNED = "controller.owned";
     private static final String OWNED_HZ = "controller.ownedHz";
     private static final String BASE_MIN = "controller.baselineMin";
     private static final String BASE_PEAK = "controller.baselinePeak";
-    private static final String TEMP_WAKE_AT = "controller.temporaryBottomWakeAt";
-    /** Linux KEY_F24: the Thor's physical AYN button (gpio-keys). AYN's
-     * dual-screen assistant opens its dashboard overlay when it sees this key. */
-    private static final int KEY_F24 = 194;
-    private static final String AYN_KEY_DEVICE_NAME = "gpio-keys";
-    /** Verified on stock Thor firmware; used only if discovery fails. */
-    private static final String AYN_KEY_DEVICE_FALLBACK = "/dev/input/event0";
-    /** Give the vendor assistant a moment to attach to the freshly lit panel. */
-    private static final long PANEL_PRESS_DELAY_MS = 400L;
-
-    private static Handler sharedWorker;
-
-    /**
-     * One worker for the whole process. A reconnected service creates a new
-     * controller; sharing the thread means an old controller's pending restore
-     * and the new controller's work can never run concurrently.
-     */
-    private static synchronized Handler worker() {
-        if (sharedWorker == null) {
-            HandlerThread thread = new HandlerThread("Thor-Rate", Process.THREAD_PRIORITY_DEFAULT);
-            thread.start();
-            sharedWorker = new Handler(thread.getLooper());
-        }
-        return sharedWorker;
-    }
+    private static final String WOKE_AT = "controller.temporaryBottomWakeAt";
 
     private final Context context;
     private final ContentResolver resolver;
     private final SharedPreferences prefs;
-    private final Runnable onBottomDisplayWakeRequested;
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private final Handler worker = worker();
-    private final Runnable restoreBottomMode = this::restorePreviousDisplayMode;
-    private final Runnable wakeTimeout = this::restorePreviousDisplayMode;
-    private final Runnable applyLatest = this::applyLatestTarget;
-    private final Runnable pressAynButton = this::pressAynButtonIfPanelHidden;
-    private final BooleanSupplier aynPanelShowing;
+    private final Handler worker;
+    private final Runnable apply = this::apply;
+    private final Runnable restoreBottom = this::restoreBottom;
 
-    // Written from any thread.
-    private volatile long safeAfterUptime;
-    private volatile int latestHz;
-    /** Worker thread only: when min/peak were last actually written. */
-    private long lastWriteUptime = -MIN_WRITE_GAP_MS;
+    private volatile int target;
+    /** A target that failed (write rejected / screen never came on). Not retried
+     * until a different target is requested, so failures can never loop. */
+    private volatile int failedTarget = -1;
+    private volatile long settleUntil;
+    // Worker thread only.
+    private boolean wokeBottom;
+    private long wokeAt;
 
-    // Worker-thread only.
-    private long lastWakeRequestUptime = -WAKE_REQUEST_COOLDOWN_MS;
-    private boolean temporarilyEnabledBottom;
-    private int restoreAttempts;
-    /** Show AYN's dashboard once the panel we woke is actually on. */
-    private boolean panelPending;
-    private DisplayManager.DisplayListener displayListener;
-    private String aynKeyDevice;
-    private int lastLowerPanelState = Integer.MIN_VALUE;
-
-    /**
-     * @param onBottomDisplayWakeRequested always invoked on the main thread.
-     * @param aynPanelShowing whether AYN's dashboard overlay is already visible
-     *        on the lower panel; called on the worker thread. May be null.
-     */
-    RateController(Context context, Runnable onBottomDisplayWakeRequested,
-                   BooleanSupplier aynPanelShowing) {
-        this.aynPanelShowing = aynPanelShowing;
+    /** The second argument is unused since v1.0.12 (retries are internal). */
+    RateController(Context context, Runnable unused) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
         this.prefs = new ProfileStore(context).preferences();
-        this.onBottomDisplayWakeRequested = onBottomDisplayWakeRequested;
-        // Delay the first write until Android has restored both panels.
+        HandlerThread thread = new HandlerThread("Thor-Rate");
+        thread.start();
+        this.worker = new Handler(thread.getLooper());
         postponeDisplayChanges();
-        worker.post(this::recoverInterruptedWake);
-        worker.post(this::registerDisplayListener);
+        worker.post(this::recoverAfterRestart);
     }
 
-    boolean canWrite() {
-        return Settings.System.canWrite(context);
-    }
+    // ---------------------------------------------------------------- API
 
-    /** AYN's Smooth Display path is global, not exclusive to display 0.
-     * A rate write must wait for both panels to settle (fail closed). Any thread. */
-    void postponeDisplayChanges() {
-        safeAfterUptime = SystemClock.uptimeMillis() + WAKE_SETTLE_MS;
-    }
-
-    /** Request a target rate (0 = relinquish). Returns immediately; any thread. */
-    /**
-     * Request a target rate (0 = relinquish). Returns immediately; any thread.
-     * Applied only once the request has been stable for the user's switch
-     * delay, so swapping quickly through apps causes one write, for the app
-     * you land on, instead of one per app.
-     */
     void onTargetChanged(int hz) {
         if (hz != 0 && hz != 60 && hz != 120) return;
-        latestHz = hz;
-        worker.removeCallbacks(applyLatest);
-        worker.postDelayed(applyLatest, ProfileStore.switchDelayMs(prefs));
+        if (hz != target) failedTarget = -1;
+        target = hz;
+        worker.removeCallbacks(apply);
+        worker.postDelayed(apply, SWITCH_DELAY_MS);
     }
 
     void relinquish() { onTargetChanged(0); }
 
-    /** A screen-on notification can finish an interrupted temporary switch. Any thread. */
-    void resumeTemporaryRestore() {
-        worker.post(this::restoreAfterSwitch);
+    /** Called by the service on screen on/off and display-mode changes. */
+    void postponeDisplayChanges() {
+        settleUntil = SystemClock.uptimeMillis() + SETTLE_MS;
     }
 
-    /**
-     * Called when Android disconnects the monitoring service. Blocks the caller
-     * for at most {@link #STOP_WAIT_MS} so the override is released before the
-     * process may be torn down, as the synchronous v1.0.4 code did.
-     */
+    /** Called after screen-on; lets a pending switch finish. */
+    void resumeTemporaryRestore() {
+        worker.removeCallbacks(apply);
+        worker.post(apply);
+    }
+
+    /** Service is going away: release the override if it can be done safely now. */
     void onServiceStopping() {
         CountDownLatch done = new CountDownLatch(1);
-        worker.removeCallbacks(applyLatest);
+        worker.removeCallbacks(apply);
         worker.post(() -> {
             try {
-                stopOnWorker();
+                target = 0;
+                if (bothScreensReady()) apply();
+                if (wokeBottom) restoreBottom();
             } finally {
                 done.countDown();
             }
         });
         try {
-            if (!done.await(STOP_WAIT_MS, TimeUnit.MILLISECONDS))
-                Log.w(TAG, "Relinquish still running at service teardown; continuing in background");
+            done.await(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
     }
 
-    // ------------------------------------------------------------------
-    // Everything below runs on the worker thread.
-    // ------------------------------------------------------------------
+    boolean canWrite() { return Settings.System.canWrite(context); }
 
-    /** Recover a short, interrupted temporary wake after a service restart.
-     * An old marker is discarded rather than turning off a screen that the
-     * user might have enabled manually in the meantime. */
-    private void recoverInterruptedWake() {
-        long started = prefs.getLong(TEMP_WAKE_AT, 0L);
-        long elapsed = System.currentTimeMillis() - started;
-        if (started > 0L && elapsed >= 0L && elapsed < RECOVERY_WINDOW_MS
-                && displayMode() == 0) {
-            temporarilyEnabledBottom = true;
-            worker.removeCallbacks(wakeTimeout);
-            worker.postDelayed(wakeTimeout, WAKE_TIMEOUT_MS);
-        } else if (started != 0L) {
-            prefs.edit().remove(TEMP_WAKE_AT).commit();
+    // ---------------------------------------------------- worker thread
+
+    private void apply() {
+        if (!canWrite()) return;
+        int hz = target;
+        if (hz == failedTarget) { done(); return; }
+        String curMin = read(MIN);
+        String curPeak = read(PEAK);
+
+        // A manual change in AYN's control center ends our override.
+        boolean owned = prefs.getBoolean(OWNED, false);
+        if (owned && !isOurs(curMin, curPeak, prefs.getInt(OWNED_HZ, 0))) {
+            Log.i(TAG, "Rate changed outside the app; leaving it alone");
+            prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ)
+                    .remove(BASE_MIN).remove(BASE_PEAK).commit();
+            owned = false;
+        }
+
+        String wantMin;
+        String wantPeak;
+        if (hz == 0) {
+            if (!owned) { done(); return; }          // nothing of ours to undo
+            wantMin = prefs.getString(BASE_MIN, null);
+            wantPeak = prefs.getString(BASE_PEAK, null);
+        } else {
+            wantMin = wantPeak = hz == 120 ? "120.00001" : "60.0";
+        }
+        if (same(curMin, wantMin) && same(curPeak, wantPeak)) {
+            if (hz != 0 && owned) prefs.edit().putInt(OWNED_HZ, hz).commit();
+            done();
+            return;
+        }
+
+        if (!topScreenOn()) return;                  // screen-on event retries
+
+        if (!bothScreensReady()) {
+            int mode = displayMode();
+            if (mode == MODE_TOP_ONLY && !wokeBottom) {
+                if (!wakeBottom()) { failedTarget = hz; return; }
+            } else if (wokeBottom && SystemClock.uptimeMillis() - wokeAt > WAKE_TIMEOUT_MS) {
+                Log.w(TAG, "Lower screen did not come on; giving up this switch");
+                failedTarget = hz;
+                restoreBottom();
+                return;
+            } else if (!wokeBottom) {
+                // Lower screen off some other way (e.g. AYN button long-press):
+                // wait until it is on again; the service retries then.
+                Log.i(TAG, "Waiting for the lower screen (mode " + mode + ")");
+                return;
+            }
+            worker.removeCallbacks(apply);
+            worker.postDelayed(apply, RETRY_MS);
+            return;
+        }
+
+        // Both screens on and settled: write.
+        if (hz != 0 && !owned) {
+            prefs.edit().putString(BASE_MIN, curMin).putString(BASE_PEAK, curPeak).commit();
+        }
+        long started = SystemClock.uptimeMillis();
+        boolean ok = writePair(wantMin, wantPeak, curMin, curPeak);
+        if (ok && hz != 0) {
+            prefs.edit().putBoolean(OWNED, true).putInt(OWNED_HZ, hz).commit();
+        } else if (ok) {
+            prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ)
+                    .remove(BASE_MIN).remove(BASE_PEAK).commit();
+        }
+        if (!ok) failedTarget = hz;
+        Log.i(TAG, String.format(Locale.ROOT, "%s %s in %d ms",
+                hz == 0 ? "Restored manual rate" : "Set " + hz + " Hz",
+                ok ? "ok" : "FAILED", SystemClock.uptimeMillis() - started));
+        done();
+    }
+
+    /** After a switch: switch a lower screen we turned on back off. */
+    private void done() {
+        if (!wokeBottom) return;
+        worker.removeCallbacks(restoreBottom);
+        worker.postDelayed(restoreBottom, RESTORE_DELAY_MS);
+    }
+
+    private boolean wakeBottom() {
+        if (!ThorBridge.run("settings put system " + DUAL_SCREEN_MODE + " " + MODE_BOTH)) {
+            Log.w(TAG, "Could not turn the lower screen on");
+            return false;
+        }
+        Log.i(TAG, "Lower screen on for the switch");
+        wokeBottom = true;
+        wokeAt = SystemClock.uptimeMillis();
+        prefs.edit().putLong(WOKE_AT, System.currentTimeMillis()).commit();
+        postponeDisplayChanges();
+        return true;
+    }
+
+    private void restoreBottom() {
+        worker.removeCallbacks(restoreBottom);
+        if (!wokeBottom) return;
+        wokeBottom = false;
+        prefs.edit().remove(WOKE_AT).commit();
+        // Only undo our own change; if the user changed the mode meanwhile, keep it.
+        if (displayMode() == MODE_BOTH && topScreenOn()) {
+            ThorBridge.run("settings put system " + DUAL_SCREEN_MODE + " " + MODE_TOP_ONLY);
+            postponeDisplayChanges();
+            Log.i(TAG, "Lower screen off again");
         }
     }
 
-    /** Reacts the moment the lower panel turns on, instead of waiting for the
-     * 2-second settle guard, so the dashboard appears with the panel. */
-    private void registerDisplayListener() {
+    /** If the app died while the lower screen was temporarily on, switch it off. */
+    private void recoverAfterRestart() {
+        long at = prefs.getLong(WOKE_AT, 0L);
+        if (at == 0L) return;
+        long age = System.currentTimeMillis() - at;
+        if (age >= 0 && age < 30_000L && displayMode() == MODE_BOTH) {
+            wokeBottom = true;
+            restoreBottom();
+        } else {
+            prefs.edit().remove(WOKE_AT).commit();
+        }
+    }
+
+    // -------------------------------------------------------- screens
+
+    private boolean topScreenOn() {
+        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        if (power == null || !power.isInteractive()) return false;
         DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        if (dm == null || displayListener != null) return;
-        displayListener = new DisplayManager.DisplayListener() {
-            @Override public void onDisplayAdded(int displayId) {
-                lowerPanelChanged(displayId);
-                showPanelIfPending();
-            }
-            @Override public void onDisplayChanged(int displayId) {
-                lowerPanelChanged(displayId);
-                showPanelIfPending();
-            }
-            @Override public void onDisplayRemoved(int displayId) {
-                if (displayId == Display.DEFAULT_DISPLAY) return;
-                lastLowerPanelState = Integer.MIN_VALUE;
-                postponeDisplayChanges();
-            }
-        };
-        dm.registerDisplayListener(displayListener, worker);
+        Display top = dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
+        return top != null && top.getState() == Display.STATE_ON;
     }
 
-    /**
-     * v1.0.10: never write while the lower panel is changing state (powering
-     * on/off, mode change). Any change pushes the next write back by the
-     * settle period; a deferred write retries by itself afterwards.
-     */
-    private void lowerPanelChanged(int displayId) {
-        if (displayId == Display.DEFAULT_DISPLAY) return;
+    private boolean bothScreensReady() {
+        if (!topScreenOn() || displayMode() != MODE_BOTH) return false;
+        if (SystemClock.uptimeMillis() < settleUntil) return false;
         DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        Display display = dm == null ? null : dm.getDisplay(displayId);
-        if (display == null) return;
-        // Only power-state transitions count. Frequent info updates (frame
-        // rate, etc.) must not postpone switching indefinitely.
-        int state = display.getState();
-        if (state == lastLowerPanelState) return;
-        lastLowerPanelState = state;
-        postponeDisplayChanges();
-    }
-
-    /** Retry the newest target once the settle period has passed. */
-    private void retryAfterSettle() {
-        long wait = safeAfterUptime - SystemClock.uptimeMillis();
-        if (wait <= 0) return;
-        worker.removeCallbacks(applyLatest);
-        worker.postDelayed(applyLatest, wait + 50L);
-    }
-
-    private void unregisterDisplayListener() {
-        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        if (dm != null && displayListener != null) dm.unregisterDisplayListener(displayListener);
-        displayListener = null;
-    }
-
-    /**
-     * Only after this controller turned the lower panel on for a switch: open
-     * AYN's dashboard there, so its "60/120 FPS MODE" badge confirms the
-     * change. A panel the user had on already is never touched.
-     */
-    private void showPanelIfPending() {
-        if (!panelPending || !temporarilyEnabledBottom || !bottomPanelOn()) return;
-        panelPending = false;
-        worker.removeCallbacks(pressAynButton);
-        worker.postDelayed(pressAynButton, PANEL_PRESS_DELAY_MS);
-    }
-
-    private boolean bottomPanelOn() {
-        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        Display bottom = BottomDisplay.find(dm);
+        Display bottom = lowerScreen(dm);
         return bottom != null && bottom.getState() == Display.STATE_ON;
     }
 
-    /**
-     * The AYN button toggles the dashboard, so it is pressed only when the
-     * overlay is not already visible. The press is injected at the kernel
-     * input level (identical to the physical button) because Android has no
-     * key code for F24 that the vendor assistant would recognise.
-     */
-    private void pressAynButtonIfPanelHidden() {
-        if (!temporarilyEnabledBottom || displayMode() != 0 || !bottomPanelOn()) return;
-        if (aynPanelShowing != null) {
-            try {
-                if (aynPanelShowing.getAsBoolean()) return;
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Could not check the AYN panel; not pressing the button", e);
-                return;
-            }
-        }
-        String device = aynKeyDevice();
-        String key = "sendevent " + device + " 1 " + KEY_F24 + " ";
-        String sync = "sendevent " + device + " 0 0 0";
-        boolean ok = ThorBridge.run(key + "1") && ThorBridge.run(sync);
-        // Always release the key, even if the press failed half-way.
-        ok &= ThorBridge.run(key + "0") & ThorBridge.run(sync);
-        if (!ok) Log.w(TAG, "Could not press the AYN button on " + device);
-    }
-
-    /** Finds the gpio-keys input node by name; event numbers can change per boot. */
-    private String aynKeyDevice() {
-        if (aynKeyDevice != null) return aynKeyDevice;
-        String found = parseInputDevice(ThorBridge.output("cat /proc/bus/input/devices"),
-                AYN_KEY_DEVICE_NAME);
-        if (found != null) {
-            aynKeyDevice = found;
-            Log.i(TAG, "AYN button input device: " + found);
-            return found;
-        }
-        Log.w(TAG, "AYN button device not found; using " + AYN_KEY_DEVICE_FALLBACK);
-        return AYN_KEY_DEVICE_FALLBACK;
-    }
-
-    /** Parses /proc/bus/input/devices; returns e.g. /dev/input/event0, or null. */
-    static String parseInputDevice(String devices, String name) {
-        if (devices == null) return null;
-        boolean inDevice = false;
-        for (String raw : devices.split("\n")) {
-            String line = raw.trim();
-            if (line.isEmpty()) {
-                inDevice = false;
-            } else if (line.startsWith("N: Name=")) {
-                inDevice = line.equals("N: Name=\"" + name + "\"");
-            } else if (inDevice && line.startsWith("H: Handlers=")) {
-                for (String handler : line.substring("H: Handlers=".length()).split("\\s+")) {
-                    if (handler.matches("event[0-9]{1,3}")) return "/dev/input/" + handler;
-                }
-            }
+    /** Display 4 on stock firmware; otherwise any other non-default display. */
+    private static Display lowerScreen(DisplayManager dm) {
+        if (dm == null) return null;
+        Display d = dm.getDisplay(4);
+        if (d != null) return d;
+        for (Display other : dm.getDisplays()) {
+            if (other.getDisplayId() != Display.DEFAULT_DISPLAY) return other;
         }
         return null;
-    }
-
-    private void stopOnWorker() {
-        unregisterDisplayListener();
-        // Never initiate a new asynchronous wake on teardown: there will be
-        // no monitor left to retry the pending refresh-rate operation.
-        if (panelsReady()) applyTarget(0, false);
-        if (temporarilyEnabledBottom) {
-            // The pending restore runs without depending on the service's
-            // foreground detection, even if the switch was interrupted.
-            worker.removeCallbacks(restoreBottomMode);
-            long safeDelay = Math.max(0L, safeAfterUptime - SystemClock.uptimeMillis());
-            worker.postDelayed(restoreBottomMode, safeDelay + RESTORE_SETTLE_MS);
-        }
-    }
-
-    private void applyLatestTarget() {
-        long wait = lastWriteUptime + MIN_WRITE_GAP_MS - SystemClock.uptimeMillis();
-        if (wait > 0) {
-            // Too soon after the previous write: apply the newest target later.
-            worker.removeCallbacks(applyLatest);
-            worker.postDelayed(applyLatest, wait);
-            return;
-        }
-        applyTarget(latestHz, true);
-    }
-
-    private boolean panelsReady() {
-        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        if (power == null || !power.isInteractive()) return false;
-        if (displayMode() != 0) return false;
-        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        if (dm == null) return false;
-        Display top = dm.getDisplay(Display.DEFAULT_DISPLAY);
-        Display bottom = BottomDisplay.find(dm);
-        return top != null && top.getState() == Display.STATE_ON
-                && bottom != null && bottom.getState() == Display.STATE_ON
-                && SystemClock.uptimeMillis() >= safeAfterUptime;
     }
 
     private int displayMode() {
         return Settings.System.getInt(resolver, DUAL_SCREEN_MODE, -1);
     }
 
-    private String read(String key) {
-        return Settings.System.getString(resolver, key);
+    // ------------------------------------------------------- settings
+
+    private String read(String key) { return Settings.System.getString(resolver, key); }
+
+    /** Ours = min = peak = Hz (also accepts the 60/120 range written by v1.0.7-1.0.11). */
+    private static boolean isOurs(String min, String peak, int hz) {
+        if (hz == 0) return false;
+        if (near(min, hz) && near(peak, hz)) return true;
+        return hz == 120 && near(min, 60) && near(peak, 120);
     }
 
-    /** Lowest rate the Thor's fixed 60 Hz lower panel supports. */
-    private static final float LOWER_PANEL_HZ = 60f;
-
-    /**
-     * v1.0.7: every profile keeps 60 Hz inside the allowed range. The lower
-     * panel only has a 60 Hz mode, and these keys apply to both panels, so
-     * min = peak = 120 left it with no valid mode. That is the likely cause of
-     * the lower screen going black and unresponsive. 60..120 still lets the
-     * top panel run at 120; 60..60 locks it to 60.
-     */
-    static String minFor(int hz) { return "60.0"; }
-
-    static String peakFor(int hz) { return hz == 120 ? "120.00001" : "60.0"; }
-
-    /** A range the lower panel can display, so it may be written while that panel is off. */
-    private static boolean lowerPanelSafe(String min) {
-        return parse(min, 0f) <= LOWER_PANEL_HZ + 0.5f;
-    }
-
-    /** Direct switching only needs the top panel awake and settled. */
-    private boolean topReady() {
-        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        if (power == null || !power.isInteractive()) return false;
-        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        Display top = dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
-        return top != null && top.getState() == Display.STATE_ON
-                && SystemClock.uptimeMillis() >= safeAfterUptime;
-    }
-
-    /** Executed only on foreground changes or when a profile is edited. */
-    private void applyTarget(int hz, boolean allowWake) {
-        if (!canWrite() || (hz != 0 && hz != 60 && hz != 120)) return;
-        long startedAt = SystemClock.uptimeMillis();
-
-        // Never restore the lower screen in the middle of a new rate write.
-        worker.removeCallbacks(restoreBottomMode);
-        // The vendor display-mode change may be asynchronous. Mode 1 here can
-        // still mean our wake request is in flight, not that it has failed.
-        int mode = displayMode();
-        if (temporarilyEnabledBottom && mode != 0 && mode != 1) clearTemporaryWake();
-
-        boolean owned = prefs.getBoolean(OWNED, false);
-        int previousHz = prefs.getInt(OWNED_HZ, 0);
-        String currentMin = read(MIN);
-        String currentPeak = read(PEAK);
-
-        // Respect changes made directly in the Thor control center.
-        if (owned && !matchesOwned(currentMin, currentPeak, previousHz)) {
-            prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ).commit();
-            owned = false;
-        }
-        if (hz == 0 && !owned) {
-            restoreAfterSwitch();
-            return;
-        }
-
-        String targetMin = hz == 0 ? prefs.getString(BASE_MIN, null) : minFor(hz);
-        String targetPeak = hz == 0 ? prefs.getString(BASE_PEAK, null) : peakFor(hz);
-        if (hz == 0 && !lowerPanelSafe(targetMin)) {
-            // v1.0.8: the manual setting we hand back (e.g. AYN's 120 FPS mode,
-            // 120/120) has no mode the 60 Hz lower panel can show. Restore it as
-            // 60..peak instead: the top panel behaves the same, and the restore
-            // no longer has to wait until the lower screen is turned on again.
-            Log.i(TAG, "Restoring manual " + targetMin + "/" + targetPeak
-                    + " as " + minFor(0) + "/" + targetPeak + " (lower panel is 60 Hz only)");
-            targetMin = minFor(0);
-        }
-        if (hz != 0 && same(currentMin, targetMin) && same(currentPeak, targetPeak)) {
-            // Already applied: nothing to write, and no reason to wake anything.
-            if (owned && previousHz != hz) prefs.edit().putInt(OWNED_HZ, hz).commit();
-            restoreAfterSwitch();
-            return;
-        }
-
-        // Writes whose range the lower panel can show go straight through, even
-        // with that panel off. Anything else (only a restored manual baseline
-        // above 60 Hz, or the optional legacy mode) waits for both panels.
-        boolean wakeMode = prefs.getBoolean(ProfileStore.WAKE_LOWER_SCREEN, false);
-        if (wakeMode || !lowerPanelSafe(targetMin)) {
-            if (!panelsReady()) {
-                Log.i(TAG, "Waiting for both panels before applying " + hz + " Hz"
-                        + (wakeMode ? " (wake option on)" : ""));
-                if (allowWake && wakeMode) wakeBottomDisplayForSwitch();
-                // Otherwise the display-mode observer retries once the lower panel is on.
-                retryAfterSettle();
-                return;
-            }
-        } else if (!topReady()) {
-            Log.i(TAG, "Top panel asleep or displays settling; " + hz + " Hz deferred");
-            // Settling: retry automatically. Asleep: the screen-on event retries.
-            retryAfterSettle();
-            return;
-        }
-
-        boolean ok;
-        if (hz == 0) {
-            ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
-            lastWriteUptime = SystemClock.uptimeMillis();
-            if (ok) {
-                prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ)
-                        .remove(BASE_MIN).remove(BASE_PEAK).commit();
-            }
-        } else {
-            // Capture the manual settings before first overriding them.
-            // commit() is deliberate: this state must survive a crash, and we
-            // are on the worker thread, so the disk write blocks nothing visible.
-            if (!owned) {
-                prefs.edit().putString(BASE_MIN, currentMin)
-                        .putString(BASE_PEAK, currentPeak).commit();
-            }
-            ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
-            lastWriteUptime = SystemClock.uptimeMillis();
-            if (ok) {
-                prefs.edit().putBoolean(OWNED, true).putInt(OWNED_HZ, hz).commit();
-            } else {
-                prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ).commit();
-            }
-        }
-        Log.i(TAG, String.format(Locale.ROOT, "%s %s in %d ms (%s)",
-                hz == 0 ? "Released override" : "Applied " + hz + " Hz",
-                ok ? "ok" : "FAILED", SystemClock.uptimeMillis() - startedAt,
-                temporarilyEnabledBottom ? "lower screen woken" : "direct"));
-        // Restore top-only mode only when this controller turned the lower
-        // panel on for the switch. An already-on panel must stay on.
-        restoreAfterSwitch();
-    }
-
-    /** Let the rate change settle before restoring the user's original mode. */
-    private void restoreAfterSwitch() {
-        if (!temporarilyEnabledBottom || !panelsReady()) return;
-        worker.removeCallbacks(restoreBottomMode);
-        worker.postDelayed(restoreBottomMode, RESTORE_SETTLE_MS);
-    }
-
-    /** Restore top-only mode on the same AYN bridge used to wake the panel. */
-    private void restorePreviousDisplayMode() {
-        if (!temporarilyEnabledBottom) return;
-        int mode = displayMode();
-        if (mode != 0) {
-            // The user or firmware has already changed the mode. Never override it.
-            clearTemporaryWake();
-            return;
-        }
-
-        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        if (power == null || !power.isInteractive()) {
-            // Do not change displays in sleep. A screen-on event retries this.
-            return;
-        }
-        if (restoreAttempts >= MAX_RESTORE_ATTEMPTS) {
-            Log.w(TAG, "Could not restore top-only mode; leaving displays unchanged");
-            clearTemporaryWake();
-            return;
-        }
-        restoreAttempts++;
-        if (!ThorBridge.run("settings put system " + DUAL_SCREEN_MODE + " 1")) {
-            Log.w(TAG, "Could not restore the original top-only display mode");
-        }
-        // The vendor assistant may apply the mode asynchronously. Verify it,
-        // and retry a bounded number of times if the request was ignored.
-        worker.removeCallbacks(restoreBottomMode);
-        if (displayMode() == 1) clearTemporaryWake();
-        else worker.postDelayed(restoreBottomMode, RESTORE_RETRY_MS);
-    }
-
-    private void clearTemporaryWake() {
-        temporarilyEnabledBottom = false;
-        panelPending = false;
-        worker.removeCallbacks(pressAynButton);
-        restoreAttempts = 0;
-        worker.removeCallbacks(restoreBottomMode);
-        worker.removeCallbacks(wakeTimeout);
-        prefs.edit().remove(TEMP_WAKE_AT).commit();
-    }
-
-    /** Only top-only mode may be changed automatically. Never wake a sleeping
-     * device or override bottom-only / unknown display configurations. */
-    private void wakeBottomDisplayForSwitch() {
-        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        if (power == null || !power.isInteractive()) return;
-        if (displayMode() != 1 || temporarilyEnabledBottom) return;
-        DisplayManager displays = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
-        Display top = displays == null ? null : displays.getDisplay(Display.DEFAULT_DISPLAY);
-        if (top == null || top.getState() != Display.STATE_ON) return;
-
-        long now = SystemClock.uptimeMillis();
-        if (now - lastWakeRequestUptime < WAKE_REQUEST_COOLDOWN_MS) return;
-        lastWakeRequestUptime = now;
-
-        // Writing the stock mode key lets the vendor assistant restore its own
-        // cover, touch state and display brightness in the normal way.
-        if (!ThorBridge.run("settings put system " + DUAL_SCREEN_MODE + " 0")) {
-            Log.w(TAG, "Could not request dual-screen mode before rate switch");
-            return;
-        }
-        temporarilyEnabledBottom = true;
-        panelPending = true;
-        restoreAttempts = 0;
-        prefs.edit().putLong(TEMP_WAKE_AT, System.currentTimeMillis()).commit();
-        worker.removeCallbacks(wakeTimeout);
-        worker.postDelayed(wakeTimeout, WAKE_TIMEOUT_MS);
-        postponeDisplayChanges();
-        // The service's retry logic lives on the main thread.
-        if (onBottomDisplayWakeRequested != null) main.post(onBottomDisplayWakeRequested);
-    }
-
-    /**
-     * Widen the acceptable range before narrowing it. A temporary min > peak
-     * may cause a blank screen on some Thor firmware revisions.
-     */
+    /** Raise peak before min, lower min before peak: never min > peak in between. */
     private boolean writePair(String min, String peak, String oldMin, String oldPeak) {
-        boolean increasing = parse(min, 0f) > parse(oldMin, 0f)
-                || parse(peak, 0f) > parse(oldPeak, 0f);
-
-        String first = increasing ? PEAK : MIN;
-        String second = increasing ? MIN : PEAK;
-        String firstValue = increasing ? peak : min;
-        String secondValue = increasing ? min : peak;
-
-        boolean ok = (same(increasing ? oldPeak : oldMin, firstValue)
-                    || write(first, firstValue))
-                && (same(increasing ? oldMin : oldPeak, secondValue)
-                    || write(second, secondValue));
-        if (ok) {
-            // Verify the settings provider has actually accepted both changes.
-            ok = same(read(MIN), min) && same(read(PEAK), peak);
-        }
-        if (!ok) {
-            Log.w(TAG, "Refresh-rate change was not applied; restoring prior values");
-            // Restore with the same safe ordering logic, without recursion.
-            boolean restoreIncreasing = parse(oldMin, 0f) > parse(read(MIN), 0f)
-                    || parse(oldPeak, 0f) > parse(read(PEAK), 0f);
-            if (restoreIncreasing) {
-                write(PEAK, oldPeak);
-                write(MIN, oldMin);
-            } else {
-                write(MIN, oldMin);
-                write(PEAK, oldPeak);
-            }
-        }
-        return ok;
-    }
-
-    /** An external/manual rate change relinquishes the previous app override. */
-    private static boolean matchesOwned(String min, String peak, int hz) {
-        if (hz == 0 || min == null || peak == null) return false;
-        // Current ranges, or the min = peak = Hz ranges written up to v1.0.6
-        // (so an update keeps ownership and corrects the old 120/120 lock).
-        return (same(min, minFor(hz)) && same(peak, peakFor(hz)))
-                || (near(min, hz) && near(peak, hz));
-    }
-
-    private static boolean near(String value, int hz) {
-        return value != null && Math.abs(parse(value, -1f) - hz) < 0.1f;
-    }
-
-    private static float parse(String value, float fallback) {
-        try { return value == null ? fallback : Float.parseFloat(value); }
-        catch (NumberFormatException e) { return fallback; }
-    }
-
-    private static boolean same(String a, String b) {
-        if (a == null || b == null) return a == null && b == null;
-        try { return Math.abs(Float.parseFloat(a) - Float.parseFloat(b)) < 0.01f; }
-        catch (NumberFormatException e) { return a.equals(b); }
+        boolean raising = parse(peak) > parse(oldPeak) || parse(min) > parse(oldMin);
+        boolean ok = raising
+                ? write(PEAK, peak) && write(MIN, min)
+                : write(MIN, min) && write(PEAK, peak);
+        return ok && same(read(MIN), min) && same(read(PEAK), peak);
     }
 
     private boolean write(String key, String value) {
-        // Both the key and value are strictly restricted; never pass user input
-        // to the privileged service as an arbitrary shell command.
         if (!MIN.equals(key) && !PEAK.equals(key)) return false;
-        if (value != null && !value.matches("(?:[0-9]{1,3})(?:\\.[0-9]{1,5})?")) return false;
-
-        String command = value == null ? "settings delete system " + key
+        if (value != null && !value.matches("[0-9]{1,3}(\\.[0-9]{1,5})?")) return false;
+        String cmd = value == null ? "settings delete system " + key
                 : "settings put system " + key + " " + value;
-        if (ThorBridge.run(command)) return true;
-
-        // Fallback for ordinary Android hardware. On the stock Thor, modern
-        // target SDKs may be blocked by the Settings.System client API.
+        if (ThorBridge.run(cmd)) return true;
         try {
             return Settings.System.putString(resolver, key, value);
-        } catch (SecurityException | IllegalArgumentException e) {
-            Log.w(TAG, "Could not update " + key, e);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not write " + key, e);
             return false;
         }
     }
 
-    /**
-     * One-time, user-initiated grant for our own declared DUMP permission.
-     * Uses the same Thor vendor bridge already used for FPS switching; it does
-     * not enable wireless debugging or grant privileges to other packages.
-     * The caller MUST independently verify checkSelfPermission afterwards.
-     * Blocking: call from a background thread.
-     */
+    private static boolean near(String value, int hz) {
+        return value != null && Math.abs(parse(value) - hz) < 0.1f;
+    }
+
+    private static float parse(String value) {
+        try { return value == null ? 0f : Float.parseFloat(value); }
+        catch (NumberFormatException e) { return 0f; }
+    }
+
+    private static boolean same(String a, String b) {
+        if (a == null || b == null) return a == null && b == null;
+        return Math.abs(parse(a) - parse(b)) < 0.01f;
+    }
+
+    // --------------------------------------------------------- bridge
+
+    /** One-time grant of our own DUMP permission (DroidDeck detection). Background thread. */
     static boolean grantOwnDumpPermission() {
         return ThorBridge.run("pm grant com.thor.refreshrate android.permission.DUMP");
     }
 
-    /** AYN's on-device privileged bridge; there is no app-side root dependency.
-     * Synchronized: used by the rate worker and by the UI's permission thread. */
+    /** AYN's built-in privileged command service; only fixed commands are sent. */
     private static final class ThorBridge {
         private static IBinder service;
 
-        static boolean run(String command) {
-            return output(command) != null;
-        }
-
-        /** Runs a fixed command; returns its output ("" if none) or null on failure. */
-        static synchronized String output(String command) {
-            long startedAt = SystemClock.uptimeMillis();
-            boolean ok = false;
+        static synchronized boolean run(String command) {
             try {
                 if (service == null || !service.isBinderAlive()) {
-                    Class<?> cls = Class.forName("android.os.ServiceManager");
-                    Method method = cls.getDeclaredMethod("getService", String.class);
-                    service = (IBinder) method.invoke(null, "PServerBinder");
+                    Method get = Class.forName("android.os.ServiceManager")
+                            .getDeclaredMethod("getService", String.class);
+                    service = (IBinder) get.invoke(null, "PServerBinder");
                 }
-                if (service == null) return null;
+                if (service == null) return false;
                 Parcel data = Parcel.obtain();
                 Parcel reply = Parcel.obtain();
                 try {
                     data.writeStringArray(new String[] {command, "1"});
-                    if (!service.transact(0, data, reply, 0)) return null;
-                    // The vendor method returns a byte array. Reading it also
-                    // propagates malformed replies into the safe fallback.
-                    byte[] bytes = reply.createByteArray();
-                    String result = bytes == null ? "" : new String(bytes, StandardCharsets.UTF_8);
-                    if (result.toLowerCase(Locale.ROOT).contains("permission denied")) return null;
-                    ok = true;
-                    return result;
+                    if (!service.transact(0, data, reply, 0)) return false;
+                    byte[] out = reply.createByteArray();
+                    String text = out == null ? "" : new String(out, StandardCharsets.UTF_8);
+                    return !text.toLowerCase(Locale.ROOT).contains("permission denied");
                 } finally {
                     reply.recycle();
                     data.recycle();
                 }
             } catch (Exception | LinkageError e) {
-                Log.w(TAG, "AYN privileged refresh-rate service unavailable", e);
-                return null;
-            } finally {
-                // Lets you measure real bridge latency: adb logcat -s ThorRefresh
-                Log.d(TAG, String.format(Locale.ROOT, "bridge %s (%d ms): %s",
-                        ok ? "ok" : "fail", SystemClock.uptimeMillis() - startedAt, command));
+                Log.w(TAG, "AYN bridge unavailable: " + command, e);
+                return false;
             }
         }
     }
