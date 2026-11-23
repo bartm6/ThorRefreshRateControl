@@ -51,10 +51,10 @@ Plugin 8.7.3, Gradle 8.9, JDK 17, and compile SDK 35.
 
 1. Upload the project root to `main`, including `.github/workflows/build-apk.yml`.
 2. Open **Actions → Build installable APK → Run workflow** (or push to `main`).
-3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.9-APK`
-   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.9-arm64.apk`.
+3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.11-APK`
+   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.11-arm64.apk`.
 4. To publish it under **Releases**, configure persistent signing (below), then
-   create the tag `v1.0.9` from `main`. The workflow attaches that APK to a
+   create the tag `v1.0.11` from `main`. The workflow attaches that APK to a
    GitHub prerelease. **Test-signed artifacts are deliberately not published**
    as update candidates, because their signatures change between runs.
 
@@ -92,6 +92,30 @@ variant, or credentials in the repository are required. **Never publish the
 `.jks` file or any signing password.** Signatures must match to install over
 an existing version; previously installed APKs signed with a different key
 cannot be upgraded in place.
+
+## v1.0.11: switches kick in after 0.5 s
+
+- Default switch delay is now **0.5 s** (choices: 0.25 s / 0.5 s / 1 s in the
+  update button's long-press menu; older saved values are capped at 1 s).
+- Minimum gap between writes reduced from 3 s to 0.5 s. Because a request must
+  already be stable for the switch delay, the gap never adds extra waiting.
+- Only exception: right after the lower screen turns on/off, writes wait for
+  the 2-second panel guard (black-screen protection).
+
+## v1.0.10: calmer switching (fixes black lower screen when swapping quickly)
+
+v1.0.9 detected every app switch, so swapping quickly caused bursts of
+refresh-rate writes. That desynchronised AYN's FPS badge from the real rate
+and could blank the lower screen. Switching is now deliberately calm:
+
+- **Switch delay** (default 1.5 s): a rate is applied only after the
+  foreground app has stayed the same for this long. Swapping through several
+  apps causes one write, for the app you land on. Change it in the update
+  button's long-press menu (0.5 s / 1.5 s / 3 s).
+- **Minimum gap**: at most one refresh-rate write every 3 seconds; newer
+  requests are applied when the gap has passed.
+- **Lower-panel guard**: whenever the lower panel changes power state (on,
+  off, dozing), writes wait 2 seconds and then retry automatically.
 
 ## v1.0.9: reliable foreground-app detection
 

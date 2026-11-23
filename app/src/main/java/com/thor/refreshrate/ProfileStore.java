@@ -24,6 +24,10 @@ final class ProfileStore {
     /** Legacy v1.0.3-v1.0.6 behaviour: turn the lower screen on for each switch.
      * "option." keys are included in settings backups. */
     static final String WAKE_LOWER_SCREEN = "option.wakeLowerScreen";
+    /** How long the foreground app must stay the same before its rate is applied. */
+    static final String SWITCH_DELAY_MS = "option.switchDelayMs";
+    static final int[] SWITCH_DELAY_CHOICES = {250, 500, 1000};
+    private static final int DEFAULT_SWITCH_DELAY_MS = 500;
     private static final String NAMES_MIGRATED = "steam.names.file.v1";
     private final Context context;
     private final SharedPreferences p;
@@ -50,6 +54,32 @@ final class ProfileStore {
     SharedPreferences preferences() { return p; }
 
     boolean enabled() { return p.getBoolean(MONITOR_ENABLED, true); }
+
+    static int switchDelayMs(SharedPreferences prefs) {
+        int ms = prefs.getInt(SWITCH_DELAY_MS, DEFAULT_SWITCH_DELAY_MS);
+        // Values saved by v1.0.10 (up to 3 s) are capped to the 1 s maximum.
+        return Math.max(0, Math.min(1000, ms));
+    }
+
+    int switchDelayMs() { return switchDelayMs(p); }
+
+    /** Cycles 0.25 s -> 0.5 s -> 1 s -> 0.25 s; returns the new value. */
+    int cycleSwitchDelay() {
+        int current = switchDelayMs();
+        int next = SWITCH_DELAY_CHOICES[0];
+        for (int i = 0; i < SWITCH_DELAY_CHOICES.length; i++) {
+            if (SWITCH_DELAY_CHOICES[i] == current) {
+                next = SWITCH_DELAY_CHOICES[(i + 1) % SWITCH_DELAY_CHOICES.length];
+                break;
+            }
+        }
+        p.edit().putInt(SWITCH_DELAY_MS, next).commit();
+        return next;
+    }
+
+    static String seconds(int ms) {
+        return ms % 1000 == 0 ? (ms / 1000) + " s" : (ms / 1000) + "." + (ms % 1000 / 100) + " s";
+    }
 
     boolean wakeLowerScreen() { return p.getBoolean(WAKE_LOWER_SCREEN, false); }
 

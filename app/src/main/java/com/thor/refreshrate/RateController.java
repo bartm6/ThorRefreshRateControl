@@ -51,6 +51,10 @@ final class RateController {
     /** Upper bound for blocking service teardown while we relinquish the rate. */
     private static final long STOP_WAIT_MS = 2000L;
     private static final int MAX_RESTORE_ATTEMPTS = 3;
+    /** At most one refresh-rate write per this interval. Because a request must
+     * already be stable for the switch delay (0.5 s by default), this never
+     * delays a switch beyond that; it only caps bursts. (3 s in v1.0.10.) */
+    private static final long MIN_WRITE_GAP_MS = 500L;
     private static final String OWNED = "controller.owned";
     private static final String OWNED_HZ = "controller.ownedHz";
     private static final String BASE_MIN = "controller.baselineMin";
@@ -96,6 +100,8 @@ final class RateController {
     // Written from any thread.
     private volatile long safeAfterUptime;
     private volatile int latestHz;
+    /** Worker thread only: when min/peak were last actually written. */
+    private long lastWriteUptime = -MIN_WRITE_GAP_MS;
 
     // Worker-thread only.
     private long lastWakeRequestUptime = -WAKE_REQUEST_COOLDOWN_MS;
@@ -105,6 +111,7 @@ final class RateController {
     private boolean panelPending;
     private DisplayManager.DisplayListener displayListener;
     private String aynKeyDevice;
+    private int lastLowerPanelState = Integer.MIN_VALUE;
 
     /**
      * @param onBottomDisplayWakeRequested always invoked on the main thread.
@@ -135,11 +142,17 @@ final class RateController {
     }
 
     /** Request a target rate (0 = relinquish). Returns immediately; any thread. */
+    /**
+     * Request a target rate (0 = relinquish). Returns immediately; any thread.
+     * Applied only once the request has been stable for the user's switch
+     * delay, so swapping quickly through apps causes one write, for the app
+     * you land on, instead of one per app.
+     */
     void onTargetChanged(int hz) {
         if (hz != 0 && hz != 60 && hz != 120) return;
         latestHz = hz;
         worker.removeCallbacks(applyLatest);
-        worker.post(applyLatest);
+        worker.postDelayed(applyLatest, ProfileStore.switchDelayMs(prefs));
     }
 
     void relinquish() { onTargetChanged(0); }
@@ -198,11 +211,47 @@ final class RateController {
         DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
         if (dm == null || displayListener != null) return;
         displayListener = new DisplayManager.DisplayListener() {
-            @Override public void onDisplayAdded(int displayId) { showPanelIfPending(); }
-            @Override public void onDisplayChanged(int displayId) { showPanelIfPending(); }
-            @Override public void onDisplayRemoved(int displayId) { }
+            @Override public void onDisplayAdded(int displayId) {
+                lowerPanelChanged(displayId);
+                showPanelIfPending();
+            }
+            @Override public void onDisplayChanged(int displayId) {
+                lowerPanelChanged(displayId);
+                showPanelIfPending();
+            }
+            @Override public void onDisplayRemoved(int displayId) {
+                if (displayId == Display.DEFAULT_DISPLAY) return;
+                lastLowerPanelState = Integer.MIN_VALUE;
+                postponeDisplayChanges();
+            }
         };
         dm.registerDisplayListener(displayListener, worker);
+    }
+
+    /**
+     * v1.0.10: never write while the lower panel is changing state (powering
+     * on/off, mode change). Any change pushes the next write back by the
+     * settle period; a deferred write retries by itself afterwards.
+     */
+    private void lowerPanelChanged(int displayId) {
+        if (displayId == Display.DEFAULT_DISPLAY) return;
+        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        Display display = dm == null ? null : dm.getDisplay(displayId);
+        if (display == null) return;
+        // Only power-state transitions count. Frequent info updates (frame
+        // rate, etc.) must not postpone switching indefinitely.
+        int state = display.getState();
+        if (state == lastLowerPanelState) return;
+        lastLowerPanelState = state;
+        postponeDisplayChanges();
+    }
+
+    /** Retry the newest target once the settle period has passed. */
+    private void retryAfterSettle() {
+        long wait = safeAfterUptime - SystemClock.uptimeMillis();
+        if (wait <= 0) return;
+        worker.removeCallbacks(applyLatest);
+        worker.postDelayed(applyLatest, wait + 50L);
     }
 
     private void unregisterDisplayListener() {
@@ -302,6 +351,13 @@ final class RateController {
     }
 
     private void applyLatestTarget() {
+        long wait = lastWriteUptime + MIN_WRITE_GAP_MS - SystemClock.uptimeMillis();
+        if (wait > 0) {
+            // Too soon after the previous write: apply the newest target later.
+            worker.removeCallbacks(applyLatest);
+            worker.postDelayed(applyLatest, wait);
+            return;
+        }
         applyTarget(latestHz, true);
     }
 
@@ -410,16 +466,20 @@ final class RateController {
                         + (wakeMode ? " (wake option on)" : ""));
                 if (allowWake && wakeMode) wakeBottomDisplayForSwitch();
                 // Otherwise the display-mode observer retries once the lower panel is on.
+                retryAfterSettle();
                 return;
             }
         } else if (!topReady()) {
-            Log.i(TAG, "Top panel asleep or settling; " + hz + " Hz will be applied on wake");
+            Log.i(TAG, "Top panel asleep or displays settling; " + hz + " Hz deferred");
+            // Settling: retry automatically. Asleep: the screen-on event retries.
+            retryAfterSettle();
             return;
         }
 
         boolean ok;
         if (hz == 0) {
             ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
+            lastWriteUptime = SystemClock.uptimeMillis();
             if (ok) {
                 prefs.edit().putBoolean(OWNED, false).remove(OWNED_HZ)
                         .remove(BASE_MIN).remove(BASE_PEAK).commit();
@@ -433,6 +493,7 @@ final class RateController {
                         .putString(BASE_PEAK, currentPeak).commit();
             }
             ok = writePair(targetMin, targetPeak, currentMin, currentPeak);
+            lastWriteUptime = SystemClock.uptimeMillis();
             if (ok) {
                 prefs.edit().putBoolean(OWNED, true).putInt(OWNED_HZ, hz).commit();
             } else {

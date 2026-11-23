@@ -162,9 +162,18 @@ public final class MainActivity extends Activity {
             PopupMenu menu = new PopupMenu(this, update);
             menu.getMenu().add("Backup settings");
             menu.getMenu().add("Restore settings");
+            String delayItem = "Switch delay: " + ProfileStore.seconds(profiles.switchDelayMs())
+                    + " (tap to change)";
+            menu.getMenu().add(delayItem);
             String wakeItem = "Wake lower screen for switches";
             menu.getMenu().add(wakeItem).setCheckable(true).setChecked(profiles.wakeLowerScreen());
             menu.setOnMenuItemClickListener(item -> {
+                if (delayItem.contentEquals(item.getTitle())) {
+                    int ms = profiles.cycleSwitchDelay();
+                    android.widget.Toast.makeText(this, "Switch delay: "
+                            + ProfileStore.seconds(ms), android.widget.Toast.LENGTH_SHORT).show();
+                    return true;
+                }
                 if (wakeItem.contentEquals(item.getTitle())) {
                     profiles.setWakeLowerScreen(!profiles.wakeLowerScreen());
                     return true;
