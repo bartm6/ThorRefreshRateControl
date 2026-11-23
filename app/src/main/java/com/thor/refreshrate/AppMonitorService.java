@@ -2,54 +2,85 @@ package com.thor.refreshrate;
 
 import android.accessibilityservice.AccessibilityService;
 import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.Context;
-import android.database.ContentObserver;
-import android.provider.Settings;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
-import android.content.SharedPreferences;
+import android.database.ContentObserver;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.SparseArray;
 import android.view.Display;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
+import android.view.inputmethod.InputMethodInfo;
+import android.view.inputmethod.InputMethodManager;
 
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /** App changes use Accessibility events; emulator queries run only in active sessions. */
 public final class AppMonitorService extends AccessibilityService {
+    /** Quiet period before resolving the top window after window-list churn. */
+    private static final long WINDOW_LOOKUP_DEBOUNCE_MS = 150L;
+    /** Only these window-list changes can mean a different foreground app. */
+    private static final int RELEVANT_WINDOW_CHANGES =
+            AccessibilityEvent.WINDOWS_CHANGE_ADDED
+            | AccessibilityEvent.WINDOWS_CHANGE_REMOVED
+            | AccessibilityEvent.WINDOWS_CHANGE_ACTIVE
+            | AccessibilityEvent.WINDOWS_CHANGE_FOCUSED
+            | AccessibilityEvent.WINDOWS_CHANGE_LAYER;
+    private static final long IME_REFRESH_MS = 60_000L;
+    // Adaptive emulator polling: fast right after a change, slow once stable.
+    private static final long RETRO_FAST_MS = 700L;
+    private static final long DROID_FAST_MS = 800L;
+    private static final long POLL_SLOW_MS = 2000L;
+    private static final int STABLE_READINGS_BEFORE_SLOW = 5;
+
     private ProfileStore profiles;
     private RateController rates;
     private String activeId;
     private String activePkg;
     private String activeGameId;
     private SharedPreferences.OnSharedPreferenceChangeListener profileListener;
-    private ScheduledExecutorService retroExecutor;
+    private volatile ScheduledExecutorService retroExecutor;
     private ScheduledFuture<?> retroTask;
     private ScheduledFuture<?> droidTask;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private long generation;
+    // Separate tokens: v1.0.4 shared one counter, so stopping the DroidDeck
+    // watcher also silently orphaned a running RetroArch watcher.
+    private volatile long retroGeneration;
+    private volatile long droidGeneration;
     private boolean retroResolved;
     private boolean droidResolved;
     private boolean cleaned;
     private ContentObserver displayModeObserver;
     private BroadcastReceiver screenReceiver;
     private final Runnable resumeRates = this::refreshCurrentRate;
+    private final Runnable topWindowLookup = this::resolveTopWindow;
+    private Set<String> imePackages = Collections.emptySet();
+    private long imeRefreshedAt = -IME_REFRESH_MS;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         cleaned = false;
         profiles = new ProfileStore(this);
-        rates = new RateController(this);
+        rates = new RateController(this, this::scheduleRateRefresh);
         // The bottom display can disappear during TOP-only mode or sleep.
         // Resume a profile only after the dual-screen mode has settled.
         displayModeObserver = new ContentObserver(main) {
@@ -104,7 +135,7 @@ public final class AppMonitorService extends AccessibilityService {
 
 
     private void scheduleRateRefresh() {
-        if (rates == null) return;
+        if (rates == null || cleaned) return;
         rates.postponeDisplayChanges();
         main.removeCallbacks(resumeRates);
         main.postDelayed(resumeRates, 2100);
@@ -126,11 +157,15 @@ public final class AppMonitorService extends AccessibilityService {
                         ? ProfileStore.gameplayId(visible.pkg) : null);
             }
         }
+        // Even if no foreground app can be identified after screen-on, restore
+        // a lower panel that this service temporarily enabled for a rate write.
+        rates.resumeTemporaryRestore();
     }
 
     /** Off means no app work, no game polling, and no retained FPS override. */
     private void syncEnabledState() {
         if (profiles == null || rates == null || profiles.enabled()) return;
+        main.removeCallbacks(topWindowLookup);
         stopRetroWatcher();
         stopDroidWatcher();
         activePkg = null;
@@ -147,8 +182,12 @@ public final class AppMonitorService extends AccessibilityService {
                 && type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
         int displayId = Build.VERSION.SDK_INT >= 33 ? event.getDisplayId() : -1;
         if (displayId > Display.DEFAULT_DISPLAY) return;
+        // Bounds, title, PiP, child and a11y-focus changes can't switch apps.
+        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            int changes = event.getWindowChanges();
+            if (changes != 0 && (changes & RELEVANT_WINDOW_CHANGES) == 0) return;
+        }
 
-        WindowTarget target = null;
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 && displayId == Display.DEFAULT_DISPLAY && event.getPackageName() != null) {
             String pkg = event.getPackageName().toString();
@@ -156,21 +195,35 @@ public final class AppMonitorService extends AccessibilityService {
                 String activity = event.getClassName() == null ? null : event.getClassName().toString();
                 if (ProfileStore.isRetroArch(pkg)) {
                     if (pkg.equals(activePkg)) return;
-                    target = new WindowTarget(pkg, activity);
                 } else if (ActivityModeDetector.supports(pkg)) {
                     // Android reports activity changes without polling. Ignore dialogs,
                     // overlays and unidentified sub-windows of the active emulator.
                     if (pkg.equals(activePkg) && ActivityModeDetector.detect(pkg, activity)
                             == ActivityModeDetector.UNKNOWN) return;
-                    target = new WindowTarget(pkg, activity);
-                } else {
-                    if (pkg.equals(activePkg)) return;
-                    target = new WindowTarget(pkg, activity);
+                } else if (pkg.equals(activePkg)) {
+                    return;
                 }
+                // The activity event names the app directly; a queued window-list
+                // lookup would only repeat (or race) this answer.
+                main.removeCallbacks(topWindowLookup);
+                handleTarget(new WindowTarget(pkg, activity));
+                return;
             }
         }
-        if (target == null) target = topScreenTarget();
-        if (target == null) return;
+        // No usable app in the event: resolve the top window once things settle.
+        // Window-list changes arrive in bursts (animations, IME, toasts), and each
+        // lookup is a cross-process query, so coalesce them.
+        main.removeCallbacks(topWindowLookup);
+        main.postDelayed(topWindowLookup, WINDOW_LOOKUP_DEBOUNCE_MS);
+    }
+
+    private void resolveTopWindow() {
+        if (profiles == null || !profiles.enabled() || cleaned) return;
+        WindowTarget target = topScreenTarget();
+        if (target != null) handleTarget(target);
+    }
+
+    private void handleTarget(WindowTarget target) {
         if (target.pkg.equals(activePkg) && ProfileStore.isRetroArch(target.pkg)) return;
         // DroidDeck can expose its frontend while a game remains on the top display
         // (for example, when the user taps a bottom-screen control). Its actual
@@ -224,33 +277,42 @@ public final class AppMonitorService extends AccessibilityService {
     }
 
     private void startRetroWatcher(String pkg) {
-        if (retroExecutor == null || retroExecutor.isShutdown()) return;
+        ScheduledExecutorService executor = retroExecutor;
+        if (executor == null || executor.isShutdown()) return;
         retroResolved = false;
-        long token = ++generation;
-        final int[] misses = {0};
-        retroTask = retroExecutor.scheduleWithFixedDelay(() -> {
-            RetroArchProbe.Status status = RetroArchProbe.getStatus();
-            if (status == null) {
-                misses[0]++;
-                // If Network Commands is disabled, fall back to the app's menu profile.
-                // Three unanswered queries then stop; don't poll forever unnecessarily.
-                main.post(() -> {
-                    if (generation != token || !pkg.equals(activePkg) || !profiles.enabled()) return;
-                    if (!retroResolved) {
-                        retroResolved = true;
-                        rates.onTargetChanged(profiles.rateFor(pkg, null));
-                    }
-                    if (misses[0] >= 3 && retroTask != null) retroTask.cancel(false);
-                });
-            } else {
-                misses[0] = 0;
-                main.post(() -> applyRetroStatus(pkg, token, status));
+        final long token = ++retroGeneration;
+        final PollPace pace = new PollPace(RETRO_FAST_MS);
+        final int[] misses = {0}; // Only touched on the single executor thread.
+        Runnable poll = new Runnable() {
+            @Override public void run() {
+                if (retroGeneration != token) return;
+                RetroArchProbe.Status status = RetroArchProbe.getStatus();
+                if (status == null) {
+                    misses[0]++;
+                    // If Network Commands is disabled, fall back to the app's menu profile.
+                    main.post(() -> {
+                        if (retroGeneration != token || !pkg.equals(activePkg)
+                                || !profiles.enabled()) return;
+                        if (!retroResolved) {
+                            retroResolved = true;
+                            rates.onTargetChanged(profiles.rateFor(pkg, null));
+                        }
+                    });
+                    // Three unanswered queries then stop; don't poll forever unnecessarily.
+                    if (misses[0] >= 3) return;
+                } else {
+                    misses[0] = 0;
+                    main.post(() -> applyRetroStatus(pkg, token, status));
+                }
+                schedulePoll(this, pace.next(status == null ? null : status.key()),
+                        () -> retroGeneration == token);
             }
-        }, 0, 700, TimeUnit.MILLISECONDS);
+        };
+        retroTask = schedulePoll(poll, 0L, () -> true);
     }
 
     private void applyRetroStatus(String pkg, long token, RetroArchProbe.Status status) {
-        if (generation != token || !pkg.equals(activePkg) || !profiles.enabled()) return;
+        if (retroGeneration != token || !pkg.equals(activePkg) || !profiles.enabled()) return;
         String gameId = status.loaded ? (status.idPart == null
                 ? ProfileStore.gameplayId(pkg) : ProfileStore.gameId(pkg, status.idPart)) : null;
         String id = gameId == null ? ProfileStore.appId(pkg) : gameId;
@@ -265,35 +327,57 @@ public final class AppMonitorService extends AccessibilityService {
     }
 
     private void startDroidWatcher(String pkg) {
-        if (retroExecutor == null || retroExecutor.isShutdown()) return;
+        ScheduledExecutorService executor = retroExecutor;
+        if (executor == null || executor.isShutdown()) return;
         droidResolved = false;
-        long token = ++generation;
-        final int[] misses = {0};
+        final long token = ++droidGeneration;
+        final PollPace pace = new PollPace(DROID_FAST_MS);
+        final int[] misses = {0}; // Only touched on the single executor thread.
         final MenuLatch latch = new MenuLatch();
-        droidTask = retroExecutor.scheduleWithFixedDelay(() -> {
-            DroidDeckProbe.State status = DroidDeckProbe.read(this);
-            if (status == null) {
-                if (++misses[0] >= 3) {
-                    main.post(() -> {
-                        if (token != generation || !pkg.equals(activePkg) || !profiles.enabled()) return;
-                        // Permission/provider may be unavailable on an older build.
-                        // Preserve the previous v1.5 session fallback.
-                        if (!droidResolved) rates.onTargetChanged(profiles.rateFor(pkg,
-                                activeGameId));
-                        stopDroidWatcher();
-                    });
+        Runnable poll = new Runnable() {
+            @Override public void run() {
+                if (droidGeneration != token) return;
+                DroidDeckProbe.State status = DroidDeckProbe.read(AppMonitorService.this);
+                if (status == null) {
+                    if (++misses[0] >= 3) {
+                        main.post(() -> {
+                            if (token != droidGeneration || !pkg.equals(activePkg)
+                                    || !profiles.enabled()) return;
+                            // Permission/provider may be unavailable on an older build.
+                            // Preserve the previous v1.5 session fallback.
+                            if (!droidResolved) rates.onTargetChanged(profiles.rateFor(pkg,
+                                    activeGameId));
+                            stopDroidWatcher();
+                        });
+                        return;
+                    }
+                } else {
+                    misses[0] = 0;
+                    // Never delay the FPS change waiting for the game's title.
+                    if (latch.accept(status.steamGameId, status.confirmed))
+                        main.post(() -> applyDroidState(pkg, token, status));
                 }
-            } else {
-                misses[0] = 0;
-                if (!latch.accept(status.steamGameId, status.confirmed)) return;
-                // Never delay the FPS change waiting for the game's title.
-                main.post(() -> applyDroidState(pkg, token, status));
+                String reading = status == null ? null
+                        : status.confirmed ? String.valueOf(status.steamGameId) : "unconfirmed";
+                schedulePoll(this, pace.next(reading), () -> droidGeneration == token);
             }
-        }, 0, 800, TimeUnit.MILLISECONDS);
+        };
+        droidTask = schedulePoll(poll, 0L, () -> true);
+    }
+
+    /** Self-rescheduling poll. Stopping a watcher bumps its token, which ends the chain. */
+    private ScheduledFuture<?> schedulePoll(Runnable poll, long delayMs, Alive alive) {
+        ScheduledExecutorService executor = retroExecutor;
+        if (executor == null || executor.isShutdown() || !alive.get()) return null;
+        try {
+            return executor.schedule(poll, delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException shutDown) {
+            return null;
+        }
     }
 
     private void applyDroidState(String pkg, long token, DroidDeckProbe.State state) {
-        if (token != generation || !pkg.equals(activePkg) || !profiles.enabled()) return;
+        if (token != droidGeneration || !pkg.equals(activePkg) || !profiles.enabled()) return;
         droidResolved = true;
         String gameId = state.steamGameId == null
                 ? null : ProfileStore.gameId(pkg, "steam-" + state.steamGameId);
@@ -309,7 +393,7 @@ public final class AppMonitorService extends AccessibilityService {
     }
 
     private void stopDroidWatcher() {
-        ++generation;
+        ++droidGeneration;
         if (droidTask != null) {
             droidTask.cancel(false);
             droidTask = null;
@@ -317,7 +401,7 @@ public final class AppMonitorService extends AccessibilityService {
     }
 
     private void stopRetroWatcher() {
-        ++generation; // Discard any in-flight status response from the previous foreground app.
+        ++retroGeneration; // Discard any in-flight status response from the previous foreground app.
         if (retroTask != null) {
             retroTask.cancel(false);
             retroTask = null;
@@ -341,7 +425,10 @@ public final class AppMonitorService extends AccessibilityService {
             if (windows == null) return null;
             for (AccessibilityWindowInfo window : windows) {
                 if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                android.view.accessibility.AccessibilityNodeInfo root = window.getRoot();
+                // Only the root's package name is needed. Android 13+ can skip
+                // prefetching the node subtree, keeping each lookup small.
+                AccessibilityNodeInfo root = Build.VERSION.SDK_INT >= 33
+                        ? window.getRoot(0) : window.getRoot();
                 if (root == null || root.getPackageName() == null) continue;
                 String pkg = root.getPackageName().toString();
                 if (skip(pkg)) continue;
@@ -357,7 +444,28 @@ public final class AppMonitorService extends AccessibilityService {
         return pkg.isEmpty() || pkg.equals("com.android.systemui")
                 || pkg.equals("com.odin.dualscreen.assistant")
                 || pkg.equals("com.odin.gameassistant")
-                || pkg.equals("com.google.android.inputmethod.latin");
+                || pkg.equals("com.google.android.inputmethod.latin")
+                || isInputMethod(pkg);
+    }
+
+    /** Any installed keyboard, not just Gboard, is an overlay rather than an app switch. */
+    private boolean isInputMethod(String pkg) {
+        long now = SystemClock.uptimeMillis();
+        if (now - imeRefreshedAt >= IME_REFRESH_MS) {
+            imeRefreshedAt = now;
+            try {
+                InputMethodManager imm = getSystemService(InputMethodManager.class);
+                if (imm != null) {
+                    Set<String> found = new HashSet<>();
+                    for (InputMethodInfo info : imm.getInputMethodList())
+                        found.add(info.getPackageName());
+                    imePackages = found;
+                }
+            } catch (RuntimeException e) {
+                // Keep the previous list; the hardcoded Gboard entry still applies.
+            }
+        }
+        return imePackages.contains(pkg);
     }
 
     @Override public void onInterrupt() { }
@@ -378,6 +486,7 @@ public final class AppMonitorService extends AccessibilityService {
         if (cleaned) return;
         cleaned = true;
         main.removeCallbacks(resumeRates);
+        main.removeCallbacks(topWindowLookup);
         if (displayModeObserver != null) {
             getContentResolver().unregisterContentObserver(displayModeObserver);
             displayModeObserver = null;
@@ -388,15 +497,39 @@ public final class AppMonitorService extends AccessibilityService {
         }
         stopRetroWatcher();
         stopDroidWatcher();
-        if (retroExecutor != null) {
-            retroExecutor.shutdownNow();
-            retroExecutor = null;
-        }
+        ScheduledExecutorService executor = retroExecutor;
+        retroExecutor = null;
+        if (executor != null) executor.shutdownNow();
         if (profiles != null && profileListener != null) {
             profiles.preferences().unregisterOnSharedPreferenceChangeListener(profileListener);
             profileListener = null;
         }
-        if (rates != null) rates.relinquish();
+        if (rates != null) rates.onServiceStopping();
+    }
+
+    private interface Alive {
+        boolean get();
+    }
+
+    /** Polls fast right after a change, then backs off while the reading is stable. */
+    private static final class PollPace {
+        private final long fastMs;
+        private String last;
+        private boolean first = true;
+        private int stableReadings;
+
+        PollPace(long fastMs) { this.fastMs = fastMs; }
+
+        long next(String reading) {
+            if (!first && Objects.equals(reading, last)) {
+                if (stableReadings < STABLE_READINGS_BEFORE_SLOW) stableReadings++;
+            } else {
+                first = false;
+                last = reading;
+                stableReadings = 0;
+            }
+            return stableReadings >= STABLE_READINGS_BEFORE_SLOW ? POLL_SLOW_MS : fastMs;
+        }
     }
 
     /** A confirmed Steam game is immediate; menu needs two consecutive reports. */

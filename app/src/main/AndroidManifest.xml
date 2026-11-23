@@ -15,6 +15,10 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- List installed keyboards so none of them is mistaken for the foreground app. -->
+        <intent>
+            <action android:name="android.view.InputMethod" />
+        </intent>
         <!-- Allow detecting DroidDeck's optional game-state interface. -->
         <provider android:authorities="com.droiddeck.launcher.agent" />
     </queries>

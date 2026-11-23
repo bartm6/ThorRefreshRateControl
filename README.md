@@ -51,10 +51,10 @@ Plugin 8.7.3, Gradle 8.9, JDK 17, and compile SDK 35.
 
 1. Upload the project root to `main`, including `.github/workflows/build-apk.yml`.
 2. Open **Actions → Build installable APK → Run workflow** (or push to `main`).
-3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.2-APK`
-   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.2-arm64.apk`.
+3. Open the green workflow run, then download the `ThorRefreshRateControl-v1.0.5-APK`
+   artifact. Extract the ZIP to get `ThorRefreshRateControl-v1.0.5-arm64.apk`.
 4. To publish it under **Releases**, configure persistent signing (below), then
-   create the tag `v1.0.2` from `main`. The workflow attaches that APK to a
+   create the tag `v1.0.5` from `main`. The workflow attaches that APK to a
    GitHub prerelease. **Test-signed artifacts are deliberately not published**
    as update candidates, because their signatures change between runs.
 
@@ -92,6 +92,96 @@ variant, or credentials in the repository are required. **Never publish the
 `.jks` file or any signing password.** Signatures must match to install over
 an existing version; previously installed APKs signed with a different key
 cannot be upgraded in place.
+
+## v1.0.5: smoother switching and more robust detection
+
+No settings, profiles, permissions or storage keys change; this is an in-place
+update. Display-mode behaviour (temporary lower-screen wake and restore) is the
+same as v1.0.4.
+
+- **Switching no longer blocks the monitor.** Every AYN bridge call is a
+  synchronous binder call that runs a shell command, and a switch can need
+  several. They now run on a dedicated `Thor-Rate` worker thread instead of the
+  accessibility service's main thread. If several requests arrive while one is
+  in progress, only the newest target is applied.
+- **Lower panel found dynamically.** The bottom display is no longer assumed to
+  be display 4. The app picks the built-in, non-default display reported by
+  Android (ID 4 is only a tie-breaker), so a firmware renumbering doesn't
+  silently stop switching.
+- **Every keyboard is ignored**, not only Gboard. Opening any installed input
+  method on the top screen is no longer treated as an app switch.
+- **Fewer window lookups.** Window-list changes that can't mean an app switch
+  (bounds, titles, PiP, child windows) are ignored. The remaining ones are
+  coalesced with a 150 ms quiet period. The lookup itself fetches only the root
+  node (no subtree prefetch) on Android 13.
+- **Adaptive game polling.** RetroArch (700 ms) and DroidDeck (800 ms) are
+  polled quickly after any change, then every 2 s once the reading has been
+  stable for five polls. Any change returns to fast polling.
+- **Fix:** RetroArch and DroidDeck watchers previously shared one cancellation
+  counter. Stopping one could leave a running RetroArch watcher discarding all
+  results until you left and re-entered RetroArch (seen when the service
+  reconnected while RetroArch was open). Each watcher now has its own token.
+
+**Diagnostics:** `adb logcat -s ThorRefresh` now shows which display was chosen
+as the lower panel, the duration of every bridge command, and the total time
+of each switch.
+
+**Hardware validation required:** the threading change affects every switch.
+Test 60→120 and 120→60 with the lower panel on and in top-only mode, a reboot
+with a profiled app in the foreground, and turning the monitor off and on.
+
+## v1.0.4: restore the original lower-screen state after switching
+
+The lower display is now turned on **temporarily** if the stock Thor was in
+**top-screen-only** mode when a refresh-rate change was needed. The controller
+waits for both panels to be ready, applies the selected profile, waits another
+1.5 seconds, and requests top-screen-only mode again. If the lower screen was
+**already on**, it is never marked as temporary and remains on.
+
+- A no-op profile does not toggle the lower display.
+- The current foreground profile is always checked again after waking; an old
+  request cannot apply the wrong game's rate.
+- Interrupted attempts have a bounded recovery timer and a short-lived saved
+  temporary-wake marker, so service reconnection can restore top-only mode.
+- AYN mode changes are verified and retried up to three times. The controller
+  does not switch modes while the device is asleep or force unknown display modes.
+- This changes only the existing rate controller and monitoring-service cleanup;
+  UI, profiles, categories, permission handling, and signing are unchanged.
+
+**Hardware validation is required.** This only controls the Thor's stock
+`dual_screen_display_mode` setting, not third-party lower-screen-off utilities.
+An unresponsive vendor bridge, force-stop, or a power interruption may prevent
+restoration until the monitor reconnects. If a user manually requests the lower
+panel on *during* the temporary wake, Android exposes no separate event to
+reliably distinguish that request from the app's own wake.
+
+## v1.0.3: wake lower display before a refresh-rate switch
+
+The AYN Thor's refresh-rate settings affect the entire device. When a saved
+profile actually requires a rate change and the stock display mode is
+**top screen only** (`dual_screen_display_mode = 1`), the app requests
+**dual-screen mode** (`0`) using the same built-in AYN privileged bridge as
+its existing rate-switch code. It waits for the vendor assistant's mode change
+and the original 2-second panel settling guard before applying the profile.
+In v1.0.3, the lower screen stayed on afterwards; v1.0.4 restores the original top-only state.
+
+- A rate that is already active does not wake the lower screen unnecessarily.
+- A sleeping device is never woken by app monitoring.
+- Bottom-only or unknown vendor modes are not changed automatically.
+- If the bridge cannot enable the lower panel, **no refresh-rate write occurs**.
+- The accessibility service retries the current effective profile after the
+  display-mode observer or a successful wake request, rather than applying a
+  stale earlier profile.
+- No new permissions, background polling, settings keys, or categories.
+- The existing application ID and `thor_refresh_profiles` storage are unchanged.
+
+**Hardware validation required:** The stock firmware screen-mode listener may
+be delayed, and third-party "deep off" utilities may power off the panel
+without changing `dual_screen_display_mode`; the app does not bypass those
+utilities or issue unverified panel-power shell commands. Test a 60 → 120 and
+120 → 60 transition on the Thor while the bottom panel starts in *top-only*
+mode. A normal in-place APK update retains stored profiles only if signing
+certificates match.
 
 ## v1.0.2: second-screen safety and manual updates
 
